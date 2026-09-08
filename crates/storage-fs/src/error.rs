@@ -53,4 +53,12 @@ pub enum FsMetadataError {
     /// The platform is unsupported (e.g. non-Linux systems without `openat2`).
     #[error("platform unsupported: descriptor-relative containment requires Linux openat2")]
     PlatformUnsupported,
+
+    /// A Tokio runtime is required to execute blocking metadata operations, but none was entered.
+    #[error("tokio runtime required: {0}")]
+    RuntimeMissing(#[source] tokio::runtime::TryCurrentError),
+
+    /// A blocking metadata task failed to join (e.g. panicked or cancelled during shutdown).
+    #[error("blocking metadata task failed: {0}")]
+    TaskJoinFailed(#[source] tokio::task::JoinError),
 }

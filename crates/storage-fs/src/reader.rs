@@ -8,33 +8,103 @@ use std::path::{Path, PathBuf};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use storage_core::{ObjectKey, ObjectMetadata, ObjectMetadataReader, ReadError};
 
 use crate::error::FsMetadataError;
 
+#[cfg(all(test, target_os = "linux"))]
+type BeforeLookupHook = Arc<dyn Fn(&OwnedFd, &ObjectKey) + Send + Sync>;
+#[cfg(all(test, target_os = "linux"))]
+type OnCompleteHook = Arc<dyn Fn(Result<&ObjectMetadata, &ReadError>) + Send + Sync>;
+
+/// Narrowly scoped test hooks for verifying the internal blocking execution boundary.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Default)]
+pub(crate) struct TestHooks {
+    pub(crate) before_lookup: Option<BeforeLookupHook>,
+    pub(crate) on_complete: Option<OnCompleteHook>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl std::fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestHooks")
+            .field("before_lookup", &self.before_lookup.is_some())
+            .field("on_complete", &self.on_complete.is_some())
+            .finish()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestHooks {
+    pub(crate) fn before<F>(hook: F) -> Self
+    where
+        F: Fn(&OwnedFd, &ObjectKey) + Send + Sync + 'static,
+    {
+        Self {
+            before_lookup: Some(Arc::new(hook)),
+            on_complete: None,
+        }
+    }
+}
+
 /// Standalone filesystem metadata reader enforcing descriptor-relative resolution.
 ///
 /// Operates over a pinned root directory descriptor. On Linux, path queries are resolved
 /// beneath this pinned descriptor via `openat2` with
 /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+///
+/// # Execution Boundary and Concurrency
+/// - Potentially blocking filesystem operations (`openat2`, `fstat`) are executed
+///   on Tokio's blocking thread pool (`tokio::task::spawn_blocking`), ensuring the
+///   async caller's worker thread is not blocked by filesystem latency.
+/// - Invoking [`head`](ObjectMetadataReader::head) requires being called within the context
+///   of an entered Tokio runtime. If polled outside a Tokio runtime, the lookup fails immediately
+///   with [`FsMetadataError::RuntimeMissing`] wrapped in [`ReadError::Backend`].
+/// - Constructor [`open`](Self::open) remains synchronous and performs root directory acquisition
+///   on the caller thread.
+/// - [`open`](Self::open) opens the directory with `O_PATH` and does not issue `openat2`; thus,
+///   successful opening does not establish kernel `openat2` availability. Availability is verified
+///   during lookup.
+///
+/// # Cancellation and Lifecycle Semantics
+/// - Each blocking lookup task holds an owned reference ([`Arc<OwnedFd>`]) to the pinned root
+///   descriptor and an owned [`ObjectKey`].
+/// - Dropping or cancelling the awaiting future returned by [`head`](ObjectMetadataReader::head)
+///   does not reliably abort or stop blocking work that has already started on Tokio's blocking pool.
+/// - However, the owned task state guarantees descriptor validity and lifetime: even if the reader
+///   or future is dropped, the root descriptor remains open until the in-flight blocking task completes.
+/// - Runtime shutdown and unresponsive filesystem stalls (e.g. frozen network filesystems) retain
+///   standard blocking-task limitations; userspace cannot guarantee bounded syscall completion.
+///
+/// # Platform Support
+/// Requires Linux `openat2`. On non-Linux platforms, construction and lookups fail explicitly
+/// with [`FsMetadataError::PlatformUnsupported`]. Non-Linux execution is neither verified nor supported
+/// with fallbacks.
 #[derive(Debug)]
 pub struct FsMetadataReader {
     root_path: PathBuf,
     #[cfg(target_os = "linux")]
-    root_fd: OwnedFd,
+    root_fd: Arc<OwnedFd>,
+    #[cfg(all(test, target_os = "linux"))]
+    test_hooks: Option<TestHooks>,
 }
 
 impl FsMetadataReader {
     /// Opens an existing configured directory once and pins an owned descriptor.
     ///
     /// # Semantics
+    /// - Performs root acquisition synchronously on the caller thread.
     /// - Does not create missing directories.
     /// - An initial symlink configured as root resolves once during this open call;
     ///   the acquired descriptor becomes the sole pinned authority for all subsequent lookups.
     /// - The configured pathname is never re-resolved during subsequent queries.
     /// - Rejects empty paths and paths containing embedded NUL bytes.
+    /// - Opening with `O_PATH` does not issue `openat2` and does not establish `openat2` availability.
     ///
     /// # Platform Support
     /// Requires Linux `openat2`. On non-Linux platforms, returns [`FsMetadataError::PlatformUnsupported`].
@@ -60,8 +130,13 @@ impl FsMetadataReader {
                 return Err(FsMetadataError::RootOpenFailed { source: err });
             }
 
-            let root_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            Ok(Self { root_path, root_fd })
+            let root_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            Ok(Self {
+                root_path,
+                root_fd,
+                #[cfg(all(test, target_os = "linux"))]
+                test_hooks: None,
+            })
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -75,6 +150,12 @@ impl FsMetadataReader {
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_test_hooks(mut self, hooks: TestHooks) -> Self {
+        self.test_hooks = Some(hooks);
+        self
+    }
 }
 
 #[async_trait]
@@ -82,7 +163,49 @@ impl ObjectMetadataReader for FsMetadataReader {
     async fn head(&self, key: &ObjectKey) -> Result<ObjectMetadata, ReadError> {
         #[cfg(target_os = "linux")]
         {
-            self.head_linux(key)
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    return Err(ReadError::backend_with_source(
+                        "tokio runtime required to execute blocking metadata lookup",
+                        Box::new(FsMetadataError::RuntimeMissing(err)),
+                    ));
+                }
+            };
+
+            let root_fd = Arc::clone(&self.root_fd);
+            let key = key.clone();
+            #[cfg(test)]
+            let test_hooks = self.test_hooks.clone();
+
+            let join_res = handle
+                .spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(before) = test_hooks.as_ref().and_then(|h| h.before_lookup.as_ref())
+                    {
+                        before(&root_fd, &key);
+                    }
+
+                    let res = Self::head_sync(&root_fd, &key);
+
+                    #[cfg(test)]
+                    if let Some(on_complete) =
+                        test_hooks.as_ref().and_then(|h| h.on_complete.as_ref())
+                    {
+                        on_complete(res.as_ref());
+                    }
+
+                    res
+                })
+                .await;
+
+            match join_res {
+                Ok(result) => result,
+                Err(join_err) => Err(ReadError::backend_with_source(
+                    "blocking metadata lookup task failed",
+                    Box::new(FsMetadataError::TaskJoinFailed(join_err)),
+                )),
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -98,7 +221,7 @@ impl ObjectMetadataReader for FsMetadataReader {
 
 #[cfg(target_os = "linux")]
 impl FsMetadataReader {
-    fn head_linux(&self, key: &ObjectKey) -> Result<ObjectMetadata, ReadError> {
+    fn head_sync(root_fd: &OwnedFd, key: &ObjectKey) -> Result<ObjectMetadata, ReadError> {
         // ObjectKey guarantees non-empty, normalized relative structure without
         // leading/trailing/repeated slashes, dot/dot-dot segments, backslashes, or control characters.
         let c_rel = CString::new(key.as_str()).map_err(|_| {
@@ -120,7 +243,7 @@ impl FsMetadataReader {
         let res = unsafe {
             libc::syscall(
                 libc::SYS_openat2,
-                self.root_fd.as_raw_fd(),
+                root_fd.as_raw_fd(),
                 c_rel.as_ptr(),
                 &how,
                 std::mem::size_of::<libc::open_how>(),
@@ -600,32 +723,26 @@ mod linux_tests {
             .expect("metadata on sub_dir")
             .permissions();
 
-        // Use scoped cleanup guard strictly inside the temporary fixture
+        // Install RAII guard before modifying permissions so cleanup is guaranteed
         let mut guard = PermissionGuard::new(&sub_dir, orig_perms);
+
+        // Remove all search permissions from directory (mode 000)
+        let mut no_search_perms = guard.original_permissions.clone();
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o000))
-                .expect("set mode 000");
+            no_search_perms.set_mode(0o000);
         }
+        std::fs::set_permissions(&sub_dir, no_search_perms)
+            .expect("revoke search permissions on directory");
 
         let key = ObjectKey::parse("restricted_dir/payload.bin").unwrap();
-        let err = reader
-            .head(&key)
-            .await
-            .expect_err("head on mode 000 directory must fail with permission denied");
+        let lookup_res = reader.head(&key).await;
 
-        assert!(
-            err.is_permission_denied(),
-            "expected PermissionDenied, got: {err:?}"
-        );
-        match err {
-            ReadError::PermissionDenied {
-                key: err_key,
-                source,
-                ..
-            } => {
-                assert_eq!(err_key, key);
-                let src = source.expect("source error must be present");
+        match lookup_res {
+            Err(ReadError::PermissionDenied { key: k, source, .. }) => {
+                assert_eq!(k, key);
+                let src = source.expect("source io::Error must be preserved");
                 let io_err = src
                     .downcast_ref::<std::io::Error>()
                     .expect("downcast to io::Error");
@@ -806,5 +923,423 @@ mod linux_tests {
             err_missing,
             FsMetadataError::RootOpenFailed { .. }
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fs_metadata_blocking_execution_thread_differentiation() {
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let root_dir = fixture.path().join("root");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        let file_path = root_dir.join("thread_test.bin");
+        std::fs::write(&file_path, b"thread differentiation test").expect("write file");
+
+        let caller_thread_id = std::thread::current().id();
+        let worker_thread_id = Arc::new(std::sync::Mutex::new(None));
+        let worker_tid_clone = Arc::clone(&worker_thread_id);
+
+        let reader = FsMetadataReader::open(&root_dir)
+            .expect("open reader")
+            .with_test_hooks(TestHooks::before(move |_, _| {
+                *worker_tid_clone.lock().unwrap() = Some(std::thread::current().id());
+            }));
+
+        let key = ObjectKey::parse("thread_test.bin").unwrap();
+        let meta = reader.head(&key).await.expect("head must succeed");
+        assert_eq!(meta.size(), 27);
+
+        let worker_tid = worker_thread_id
+            .lock()
+            .unwrap()
+            .take()
+            .expect("hook must have run");
+        assert_ne!(
+            caller_thread_id, worker_tid,
+            "blocking lookup must execute on a worker pool thread distinct from the current-thread async caller"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fs_metadata_blocking_execution_does_not_starve_current_thread_task() {
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let root_dir = fixture.path().join("root");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        let file_path = root_dir.join("progress.bin");
+        std::fs::write(&file_path, b"progress").expect("write file");
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let paused_tx = Arc::new(std::sync::Mutex::new(paused_tx));
+        let hook_error = Arc::new(std::sync::Mutex::new(None::<String>));
+        let task_progress_acknowledged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let err_slot = Arc::clone(&hook_error);
+        let rx_clone = Arc::clone(&release_rx);
+        let paused_tx_clone = Arc::clone(&paused_tx);
+
+        let hooks = TestHooks {
+            before_lookup: Some(Arc::new(move |_, _| {
+                // Signal that the lookup hook has reached its paused wait point
+                if let Err(e) = paused_tx_clone.lock().unwrap().send(()) {
+                    *err_slot.lock().unwrap() = Some(format!("failed to signal pause: {e:?}"));
+                    return;
+                }
+
+                // Explicit bounded wait for release; failure to receive release is recorded as test failure
+                match rx_clone
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        *err_slot.lock().unwrap() =
+                            Some(format!("blocking hook release wait failed: {e:?}"));
+                    }
+                }
+            })),
+            on_complete: None,
+        };
+
+        let reader = FsMetadataReader::open(&root_dir)
+            .expect("open reader")
+            .with_test_hooks(hooks);
+
+        // RAII guard ensuring panic-safe release if the test thread panics before explicit release
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+
+        let key = ObjectKey::parse("progress.bin").unwrap();
+
+        // Spawn the metadata lookup on the current-thread runtime
+        let head_handle = tokio::spawn(async move { reader.head(&key).await });
+
+        // Establish that the lookup hook has entered its paused state before scheduling concurrent task
+        let start = std::time::Instant::now();
+        loop {
+            match paused_rx.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                        panic!("timed out waiting for lookup hook to enter paused state");
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("paused_tx disconnected prematurely before pause established");
+                }
+            }
+        }
+
+        // Only now schedule the other current-thread task
+        let progress_flag = Arc::clone(&task_progress_acknowledged);
+        let other_task = tokio::spawn(async move {
+            progress_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Require the concurrent task to acknowledge progress before normal release
+        other_task
+            .await
+            .expect("concurrent task on current-thread runtime must join successfully");
+
+        assert!(
+            task_progress_acknowledged.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent task must acknowledge progress while lookup is confirmed paused in blocking pool"
+        );
+
+        // Verify that the hook has not encountered an error/timeout before normal release
+        if let Some(err) = hook_error.lock().unwrap().take() {
+            panic!("hook encountered failure prior to normal release: {err}");
+        }
+
+        // Send normal release to unblock the lookup worker
+        if let Some(tx) = release_guard.0.take() {
+            tx.send(()).expect("send explicit release to worker");
+        }
+
+        let meta = head_handle
+            .await
+            .expect("head task must join")
+            .expect("head lookup must succeed");
+        assert_eq!(meta.size(), 8);
+
+        // Verify hook recorded no errors during release
+        if let Some(err) = hook_error.lock().unwrap().take() {
+            panic!("hook recorded error during release: {err}");
+        }
+
+        fixture.close().expect("fixture cleanup must succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fs_metadata_blocking_task_panic_mapped_to_backend_error() {
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let root_dir = fixture.path().join("root");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        let file_path = root_dir.join("panic_target.bin");
+        std::fs::write(&file_path, b"test").expect("write file");
+
+        let reader = FsMetadataReader::open(&root_dir)
+            .expect("open reader")
+            .with_test_hooks(TestHooks::before(|_, _| {
+                panic!("controlled test panic inside blocking metadata task");
+            }));
+
+        let key = ObjectKey::parse("panic_target.bin").unwrap();
+        let err = reader
+            .head(&key)
+            .await
+            .expect_err("panicking blocking task must result in Err");
+
+        assert!(err.is_backend(), "panic must map to ReadError::Backend");
+        assert!(!err.is_not_found(), "panic must not map to NotFound");
+        assert!(
+            !err.is_permission_denied(),
+            "panic must not map to PermissionDenied"
+        );
+
+        let source = match err {
+            ReadError::Backend {
+                message, source, ..
+            } => {
+                assert_eq!(message, "blocking metadata lookup task failed");
+                source.expect("source JoinError must be preserved")
+            }
+            other => panic!("expected Backend error, got: {other:?}"),
+        };
+
+        let fs_err = source
+            .downcast_ref::<FsMetadataError>()
+            .expect("source must downcast to FsMetadataError");
+
+        match fs_err {
+            FsMetadataError::TaskJoinFailed(join_err) => {
+                assert!(
+                    join_err.is_panic(),
+                    "preserved JoinError must identify task panic"
+                );
+            }
+            other => panic!("expected FsMetadataError::TaskJoinFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fs_metadata_head_outside_tokio_runtime_returns_typed_backend_error() {
+        use std::future::Future;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn dummy_waker() -> Waker {
+            fn noop(_: *const ()) {}
+            fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let root_dir = fixture.path().join("root");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        let file_path = root_dir.join("noruntime.bin");
+        std::fs::write(&file_path, b"test").expect("write file");
+
+        let reader = FsMetadataReader::open(&root_dir).expect("open reader");
+        let key = ObjectKey::parse("noruntime.bin").unwrap();
+
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(reader.head(&key));
+
+        let poll_res = fut.as_mut().poll(&mut cx);
+        match poll_res {
+            Poll::Ready(Err(err)) => {
+                assert!(err.is_backend(), "must be Backend error");
+                let source = match err {
+                    ReadError::Backend {
+                        message, source, ..
+                    } => {
+                        assert_eq!(
+                            message,
+                            "tokio runtime required to execute blocking metadata lookup"
+                        );
+                        source.expect("source must be present")
+                    }
+                    other => panic!("expected Backend error, got: {other:?}"),
+                };
+
+                let fs_err = source
+                    .downcast_ref::<FsMetadataError>()
+                    .expect("source must downcast to FsMetadataError");
+                assert!(
+                    matches!(fs_err, FsMetadataError::RuntimeMissing(_)),
+                    "source must be RuntimeMissing, got: {fs_err:?}"
+                );
+            }
+            Poll::Ready(Ok(_)) => panic!("lookup without runtime must not succeed"),
+            Poll::Pending => panic!("lookup without runtime must fail immediately without pending"),
+        }
+    }
+
+    #[test]
+    fn test_fs_metadata_controlled_cancellation_descriptor_lifetime() {
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let root_dir = fixture.path().join("root");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        let file_path = root_dir.join("cancellation.bin");
+        std::fs::write(&file_path, b"descriptor lifetime on cancellation").expect("write file");
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (lookup_done_tx, lookup_done_rx) = std::sync::mpsc::channel::<Result<u64, String>>();
+
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let paused_tx = Arc::new(std::sync::Mutex::new(paused_tx));
+        let lookup_done_tx = Arc::new(std::sync::Mutex::new(lookup_done_tx));
+        let hook_error = Arc::new(std::sync::Mutex::new(None::<String>));
+        let worker_is_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let err_slot = Arc::clone(&hook_error);
+        let rx_clone = Arc::clone(&release_rx);
+        let paused_tx_clone = Arc::clone(&paused_tx);
+        let is_paused_clone = Arc::clone(&worker_is_paused);
+
+        let hooks = TestHooks {
+            before_lookup: Some(Arc::new(move |_, _| {
+                is_paused_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = paused_tx_clone.lock().unwrap().send(()) {
+                    *err_slot.lock().unwrap() = Some(format!("failed to signal pause: {e:?}"));
+                    is_paused_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+
+                // Explicit bounded wait: timeout or premature disconnect is an explicit failure
+                match rx_clone
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                {
+                    Ok(()) => {
+                        is_paused_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        is_paused_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                        *err_slot.lock().unwrap() =
+                            Some(format!("worker release wait failed: {e:?}"));
+                    }
+                }
+            })),
+            on_complete: Some(Arc::new(move |res| {
+                let mapped = match res {
+                    Ok(meta) => Ok(meta.size()),
+                    Err(err) => Err(format!("{err:?}")),
+                };
+                let _ = lookup_done_tx.lock().unwrap().send(mapped);
+            })),
+        };
+
+        let reader = FsMetadataReader::open(&root_dir)
+            .expect("open reader")
+            .with_test_hooks(hooks);
+
+        // RAII guard ensuring panic-safe release in case of test panic before release
+        struct ReleaseGuard(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let mut guard = ReleaseGuard(Some(release_tx));
+
+        let key = ObjectKey::parse("cancellation.bin").unwrap();
+
+        // Own dedicated current-thread Tokio runtime
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create dedicated current-thread runtime");
+
+        runtime.block_on(async {
+            // Start head lookup and drive it until the worker enters its paused state
+            let mut head_fut = reader.head(&key);
+            tokio::select! {
+                _ = &mut head_fut => {
+                    panic!("head future should not complete before cancellation");
+                }
+                _ = async {
+                    let start = std::time::Instant::now();
+                    loop {
+                        match paused_rx.try_recv() {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(5) {
+                                    panic!("timed out waiting for worker to pause");
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                panic!("paused_tx disconnected prematurely");
+                            }
+                        }
+                    }
+                } => {}
+            }
+
+            // Cancel the lookup by dropping the future and dropping the reader
+            drop(head_fut);
+            drop(reader);
+
+            // Establish that the worker is STILL paused when awaiting future and reader are dropped
+            assert!(
+                worker_is_paused.load(std::sync::atomic::Ordering::SeqCst),
+                "worker must remain paused when awaiting future and reader are dropped"
+            );
+            assert!(
+                lookup_done_rx.try_recv().is_err(),
+                "lookup must not have completed before explicit release"
+            );
+
+            // Verify no hook error occurred prior to release
+            if let Some(err) = hook_error.lock().unwrap().take() {
+                panic!("hook recorded error prior to release: {err}");
+            }
+
+            // Release the worker only afterward
+            if let Some(tx) = guard.0.take() {
+                tx.send(()).expect("send explicit release to worker");
+            }
+
+            // Confirm successful lookup after cancellation
+            let lookup_outcome = lookup_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("lookup must complete after release");
+
+            assert_eq!(
+                lookup_outcome,
+                Ok(35),
+                "worker must successfully inspect metadata via its owned descriptor after caller cancellation"
+            );
+
+            // Verify hook recorded no errors during release
+            if let Some(err) = hook_error.lock().unwrap().take() {
+                panic!("hook recorded error during release: {err}");
+            }
+        });
+
+        // After block_on returns, drop the owned runtime before fixture.close().
+        // This waits for its started blocking tasks to finish and provides an actual
+        // completion boundary for this controlled test.
+        drop(runtime);
+
+        // Clean up temporary fixtures only after runtime shutdown has joined the blocking worker
+        fixture.close().expect("fixture cleanup must succeed");
     }
 }

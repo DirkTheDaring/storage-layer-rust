@@ -10,7 +10,8 @@ async-trait.workspace = true
 libc.workspace = true
 storage-core.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
