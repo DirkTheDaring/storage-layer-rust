@@ -1,0 +1,16 @@
+[package]
+name = "storage-fs"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Descriptor-relative filesystem storage adapter"
+
+[dependencies]
+async-trait.workspace = true
+libc.workspace = true
+storage-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
