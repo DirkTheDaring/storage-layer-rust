@@ -16,6 +16,11 @@
 //!   syscalls (`openat2`, `fstat`) to Tokio's blocking pool (`tokio::task::spawn_blocking`) and requires
 //!   an entered Tokio runtime.
 //! - Constructor [`open`](reader::FsMetadataReader::open) remains synchronous on the caller thread.
+//! - Startup capability probe ([`probe_capability`](reader::FsMetadataReader::probe_capability)) is an explicit,
+//!   backend-specific synchronous method executing on the caller thread. It opens `"."` relative to the pinned root
+//!   descriptor with `openat2` and verifies directory metadata inspection succeeds on the calling thread at that time.
+//!   It is not invoked automatically by `open` or `head`, and should not be called directly on an async executor worker thread.
+//!   Downstream registry startup invocation remains deferred.
 //!
 //! ## Open Quality Gates
 //! Quality gate **O-05** remains **OPEN**: this crate implements the standalone metadata inquiry

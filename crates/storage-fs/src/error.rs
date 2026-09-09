@@ -32,7 +32,9 @@ pub enum FsMetadataError {
         source: std::io::Error,
     },
 
-    /// The opened filesystem object is not a regular file (`S_IFREG`).
+    /// The opened filesystem object has an unsupported file type for the requested operation
+    /// (e.g. not a regular file `S_IFREG` during metadata inquiry, or not a directory `S_IFDIR`
+    /// during capability probing).
     #[error("unsupported object type (mode: {mode:#o})")]
     UnsupportedObjectType {
         /// Raw mode bitmask from `fstat`.
@@ -61,4 +63,18 @@ pub enum FsMetadataError {
     /// A blocking metadata task failed to join (e.g. panicked or cancelled during shutdown).
     #[error("blocking metadata task failed: {0}")]
     TaskJoinFailed(#[source] tokio::task::JoinError),
+
+    /// Execution of the capability probe was denied by kernel DAC, LSM, mount options, or seccomp (`EACCES` or `EPERM`).
+    ///
+    /// Note: `EACCES`/`EPERM` cannot be inferred as uniquely caused by seccomp without kernel auditing.
+    #[error("openat2 capability probe denied: {0}")]
+    ProbeDenied(#[source] std::io::Error),
+
+    /// Execution of the capability probe failed due to an unexpected I/O or system error.
+    #[error("openat2 capability probe failed: {source}")]
+    ProbeFailed {
+        /// Underlying I/O error from the capability probe.
+        #[source]
+        source: std::io::Error,
+    },
 }

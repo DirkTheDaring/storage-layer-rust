@@ -39,6 +39,15 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
   - Enforces `st_mode & S_IFMT == S_IFREG`. Rejects non-regular objects (directories, FIFOs, symlinks, sockets, devices) at the application level as `FsMetadataError::UnsupportedObjectType` without reading payloads or blocking.
   - Converts `st_size` safely to `u64`.
 
+### Startup Capability Probing (`probe_capability`)
+- `FsMetadataReader::probe_capability(&self) -> Result<(), FsMetadataError>`
+- **API Boundary**: Explicit public backend-specific API on `FsMetadataReader` with a private syscall implementation.
+- **Execution Context**: Executes synchronously on the calling thread. It may block on filesystem operations and must **not** be called directly on an async executor worker thread.
+- **No Automatic Invocation**: No automatic invocation from `open` or `head` is introduced; downstream registry startup invocation (e.g. in `FsStorage::try_new`) remains deferred.
+- **Narrow Success Definition**: Success indicates narrowly that the exact `"."` `openat2` lookup with flags `O_PATH | O_DIRECTORY | O_CLOEXEC` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, followed by directory metadata inspection (`fstat`), succeeded against the pinned root directory descriptor on the calling thread at that time.
+- **Immediate Cleanup**: The opened descriptor is immediately bound to `OwnedFd`, verified via `fstat` (`S_IFDIR`), and dropped immediately upon return, guaranteeing deterministic RAII closure.
+- **Contract Distinction**: `"."` is rejected as an `ObjectKey` by design (`ObjectKeyError::DotSegment`). `probe_capability` is a backend-private syscall probe on `FsMetadataReader` that operates directly on the pinned raw descriptor via the C string `c"."`; it does **not** construct an `ObjectKey` or route through regular-file `head`.
+
 ## 3. Error Classification and Contract Mapping
 
 | Filesystem Condition | Underlying Cause | `storage-core` Contract Mapping | Error Category & Source |
@@ -52,6 +61,19 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
 | **Ordinary I/O Error** | Other raw OS error (e.g. `EIO`) | `ReadError::Backend { message, source }` | `source` wraps causal `std::io::Error`. |
 | **Missing Runtime** | Polled outside an entered Tokio runtime | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::RuntimeMissing`. Diagnostic message: `"tokio runtime required to execute blocking metadata lookup"`. |
 | **Task Join Failure** | Blocking task panicked or cancelled during shutdown | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::TaskJoinFailed`. Causal `tokio::task::JoinError` preserved. |
+
+### Capability Probe Error Classification
+
+`probe_capability` maps raw OS errors directly to strongly typed [`FsMetadataError`](src/error.rs) variants using operation-specific classification:
+
+| Probe Condition | Syscall Outcome | `FsMetadataError` Mapping | Diagnostic Semantics |
+| :--- | :--- | :--- | :--- |
+| **Success** | `openat2` returns valid fd | `Ok(())` | Descriptor validated as directory and closed immediately. |
+| **Syscall Unavailable** | `openat2` returns `ENOSYS` | `FsMetadataError::SyscallUnsupported(err)` | Host kernel returned `ENOSYS` for `openat2(2)`. |
+| **Probe Denied** | `openat2` returns `EACCES` or `EPERM` | `FsMetadataError::ProbeDenied(err)` | Denied by DAC, LSM, mount flags, or container seccomp filter (seccomp is not inferred as unique cause). |
+| **Unexpected I/O Failure** | Other `openat2` error (`EMFILE`, `EIO`, etc.) or any `fstat` failure | `FsMetadataError::ProbeFailed { source }` | Underlying I/O error preserved. (Note: `fstat` failures, including `ENOSYS`, map to `ProbeFailed`, not `SyscallUnsupported`). |
+| **Unsupported Object Type** | Descriptor mode is not `S_IFDIR` | `FsMetadataError::UnsupportedObjectType { mode }` | Root descriptor did not stat as a directory. |
+| **Unsupported Platform** | Target platform is not Linux | `FsMetadataError::PlatformUnsupported` | Descriptor-relative containment requires Linux `openat2`. |
 
 ## 4. Guarantees and Limitations
 
@@ -75,5 +97,22 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
    - Descriptor-relative containment requires Linux `openat2`.
    - If `openat2` returns `ENOSYS`, `storage-fs` fails closed with diagnostic `"openat2 is unavailable in this execution environment"`. It does not infer a host kernel version from `ENOSYS` alone, nor does it attempt an insecure path-based fallback.
    - On non-Linux platforms, operations fail explicitly with `FsMetadataError::PlatformUnsupported`. Non-Linux compilation and execution remain unverified in the absence of a cross-compilation toolchain.
-7. **Open Quality Gates**:
+7. **Capability Probe Guarantees and Limitations**:
+   - **Narrow Scope of Success**:
+     - Success establishes only that the exact `"."` `openat2` lookup with the specified containment flags and directory metadata inspection succeeded against the pinned root descriptor on the calling thread at that time.
+   - **Properties NOT Established**:
+     1. Does not establish equivalent permissions or syscall filtering on Tokio blocking-pool threads.
+     2. Does not verify that child paths, subdirectories, or blobs exist or can be created.
+     3. Does not exercise multi-component path resolution across nested subdirectories.
+     4. Does not verify regular-file lookup (`S_IFREG`), because `"."` is a directory (`S_IFDIR`).
+     5. Does not establish payload read permissions (`O_RDONLY`) or write permissions on child objects (`O_PATH` success is not proof of ordinary directory or file read/write permission).
+     6. Does not establish root coherence across pathname-based reads and mutations.
+     7. Does not establish future availability or guarantee against dynamic runtime reconfiguration (e.g. late seccomp filter installation, filesystem remounts, or storage media failures).
+     8. Does not close quality gate **O-05** or establish production readiness.
+   - **Syscall Availability Interpretation**:
+     - If `openat2` returns `ENOSYS`, the probe reports `FsMetadataError::SyscallUnsupported`. It does not infer a specific kernel version from `ENOSYS` alone.
+   - **Execution Context & Latency**:
+     - Synchronous execution on the caller thread avoids requiring an entered Tokio runtime or thread pool dispatch during early application startup.
+     - Limitation: because it is synchronous, if the root directory resides on an unresponsive or stalled network filesystem (NFS/FUSE), the calling startup thread can block indefinitely, identically to `FsMetadataReader::open`. It must not be called directly on an async executor worker thread.
+8. **Open Quality Gates**:
    - Gate **O-05** remains **OPEN**: this crate implements an isolated metadata reader. Production registry integration, quarantine orchestration, outward HTTP compatibility, and distribution gates remain deferred.

@@ -151,6 +151,74 @@ impl FsMetadataReader {
         &self.root_path
     }
 
+    /// Probes whether the host kernel and container execution environment permit descriptor-relative `openat2` resolution.
+    ///
+    /// This is an explicit public backend-specific API on [`FsMetadataReader`] with a private syscall implementation.
+    /// No automatic invocation from [`open`](Self::open) or [`head`](storage_core::ObjectMetadataReader::head) is introduced;
+    /// downstream integration remains deferred.
+    ///
+    /// # Scope of Success
+    /// Success indicates narrowly that the exact `"."` `openat2` lookup with the specified resolution flags,
+    /// followed by directory metadata inspection, succeeded against the pinned root directory descriptor on the
+    /// calling thread at that time.
+    ///
+    /// # Execution Context
+    /// - **Synchronous & Potentially Blocking**: This method executes synchronously on the caller thread and may block
+    ///   on filesystem operations. It should not be called directly on an async executor worker thread.
+    /// - If invoked during application startup (e.g. before network listeners are bound), it provides deterministic
+    ///   initialization-time validation without requiring an entered Tokio runtime or thread pool dispatch.
+    /// - **Limitations**: If the pinned root directory resides on an unresponsive or stalled network filesystem (e.g. NFS or FUSE),
+    ///   the calling thread may block indefinitely, identically to [`open`](Self::open).
+    ///
+    /// # Important Contract Distinction
+    /// - `"."` is rejected as an [`ObjectKey`](storage_core::ObjectKey) by design (`ObjectKeyError::DotSegment`).
+    /// - This method is a backend-private syscall probe on [`FsMetadataReader`]; it does **not** construct
+    ///   an `ObjectKey` and does not route through the regular-file-only [`head`](storage_core::ObjectMetadataReader::head) method.
+    ///   `ObjectKey` validation rules are preserved without weakening.
+    ///
+    /// # Error Mapping
+    /// - [`FsMetadataError::SyscallUnsupported`]: The `openat2` syscall returned `ENOSYS`.
+    /// - [`FsMetadataError::ProbeDenied`]: Returned `EACCES` or `EPERM`. This may arise from DAC permissions, LSM restrictions,
+    ///   mount options, or container seccomp filters. Note: `EACCES`/`EPERM` cannot be inferred as uniquely caused by seccomp.
+    /// - [`FsMetadataError::ProbeFailed`]: An unexpected OS error occurred during `openat2` (e.g. `EMFILE`, `EIO`) or `fstat`.
+    /// - [`FsMetadataError::UnsupportedObjectType`]: The opened descriptor unexpectedly did not stat as a directory (`S_IFDIR`).
+    /// - [`FsMetadataError::PlatformUnsupported`]: The target platform is not Linux.
+    ///
+    /// # Boundaries and Non-Guarantees
+    /// This probe does **not**:
+    /// 1. Establish equivalent permissions or syscall filtering on Tokio blocking-pool threads.
+    /// 2. Establish that child paths, subdirectories, or blobs exist or can be created.
+    /// 3. Exercise multi-component path resolution across subdirectories.
+    /// 4. Verify regular-file lookup (`S_IFREG`), because `"."` is a directory (`S_IFDIR`).
+    /// 5. Establish payload read permissions (`O_RDONLY`) or write permissions on child objects (`O_PATH` success is not proof of ordinary read or write permission).
+    /// 6. Establish root coherence across pathname-based reads and mutations.
+    /// 7. Establish future availability or guarantee against dynamic runtime reconfiguration (e.g. late seccomp loading, remounts, or storage media failures).
+    /// 8. Close quality gate **O-05** or establish production readiness.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(target_os = "linux")]
+    /// # {
+    /// use storage_fs::FsMetadataReader;
+    ///
+    /// let temp_dir = tempfile::tempdir().unwrap();
+    /// let reader = FsMetadataReader::open(temp_dir.path()).unwrap();
+    /// reader.probe_capability().unwrap();
+    /// # }
+    /// ```
+    pub fn probe_capability(&self) -> Result<(), FsMetadataError> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::probe_capability_sync(&self.root_fd)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(FsMetadataError::PlatformUnsupported)
+        }
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_test_hooks(mut self, hooks: TestHooks) -> Self {
         self.test_hooks = Some(hooks);
@@ -221,6 +289,50 @@ impl ObjectMetadataReader for FsMetadataReader {
 
 #[cfg(target_os = "linux")]
 impl FsMetadataReader {
+    pub(crate) fn probe_capability_sync(root_fd: &OwnedFd) -> Result<(), FsMetadataError> {
+        // Direct C-string representation of ".". ObjectKey strictly rejects ".", but this
+        // backend-private syscall probe operates directly with a raw C string.
+        let c_dot = c".";
+
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+        how.mode = 0;
+        how.resolve =
+            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root_fd.as_raw_fd(),
+                c_dot.as_ptr(),
+                &how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+
+        if res < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(classify_openat2_probe_error(err));
+        }
+
+        // Wrap the target descriptor in OwnedFd immediately to guarantee leak-free cleanup
+        let probed_fd = unsafe { OwnedFd::from_raw_fd(res as i32) };
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let stat_res = unsafe { libc::fstat(probed_fd.as_raw_fd(), &mut st) };
+        if stat_res != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(classify_fstat_probe_error(err));
+        }
+
+        let mode_type = st.st_mode & libc::S_IFMT;
+        if mode_type != libc::S_IFDIR {
+            return Err(FsMetadataError::UnsupportedObjectType { mode: st.st_mode });
+        }
+
+        Ok(())
+    }
+
     fn head_sync(root_fd: &OwnedFd, key: &ObjectKey) -> Result<ObjectMetadata, ReadError> {
         // ObjectKey guarantees non-empty, normalized relative structure without
         // leading/trailing/repeated slashes, dot/dot-dot segments, backslashes, or control characters.
@@ -272,6 +384,25 @@ impl FsMetadataReader {
 
         check_stat_and_extract_metadata(&st)
     }
+}
+
+/// Classifies raw OS errors returned by `openat2` during capability probing.
+#[cfg(target_os = "linux")]
+pub(crate) fn classify_openat2_probe_error(err: std::io::Error) -> FsMetadataError {
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) => FsMetadataError::SyscallUnsupported(err),
+        Some(libc::EACCES) | Some(libc::EPERM) => FsMetadataError::ProbeDenied(err),
+        _ => FsMetadataError::ProbeFailed { source: err },
+    }
+}
+
+/// Classifies raw OS errors returned by `fstat` during capability probing.
+///
+/// An `fstat` failure (including `ENOSYS`) represents an unexpected metadata inspection
+/// failure on an opened descriptor, not an `openat2` availability rejection.
+#[cfg(target_os = "linux")]
+pub(crate) fn classify_fstat_probe_error(err: std::io::Error) -> FsMetadataError {
+    FsMetadataError::ProbeFailed { source: err }
 }
 
 /// Classifies raw OS errors returned by `openat2` without parsing rendered strings.
@@ -349,6 +480,17 @@ mod non_linux_tests {
     fn test_fs_metadata_non_linux_empty_path_validation_preserved() {
         let err = FsMetadataReader::open("").expect_err("empty path must fail first");
         assert!(matches!(err, FsMetadataError::EmptyRootPath));
+    }
+
+    #[test]
+    fn test_fs_metadata_non_linux_probe_capability_platform_unsupported() {
+        let reader = FsMetadataReader {
+            root_path: PathBuf::from("nonempty_path"),
+        };
+        let err = reader
+            .probe_capability()
+            .expect_err("must fail on non-linux");
+        assert!(matches!(err, FsMetadataError::PlatformUnsupported));
     }
 }
 
@@ -1341,5 +1483,167 @@ mod linux_tests {
 
         // Clean up temporary fixtures only after runtime shutdown has joined the blocking worker
         fixture.close().expect("fixture cleanup must succeed");
+    }
+
+    #[test]
+    fn test_fs_metadata_probe_capability_success_on_valid_root() {
+        // Assert synchronous execution outside of an active Tokio runtime
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "test must execute outside of an active Tokio runtime"
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let reader = FsMetadataReader::open(temp_dir.path()).unwrap();
+
+        let res = reader.probe_capability();
+        assert!(
+            res.is_ok(),
+            "probe_capability must succeed on valid directory root: {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_fs_metadata_probe_capability_does_not_mutate_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("pre_existing.txt");
+        let expected_payload = b"verifiable fixture content preserved across probe";
+        std::fs::write(&file_path, expected_payload).unwrap();
+
+        let mut entries_before: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries_before.sort();
+        let content_before = std::fs::read(&file_path).unwrap();
+
+        let reader = FsMetadataReader::open(temp_dir.path()).unwrap();
+        reader
+            .probe_capability()
+            .expect("capability probe must succeed");
+
+        let mut entries_after: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries_after.sort();
+        let content_after = std::fs::read(&file_path).unwrap();
+
+        assert_eq!(
+            entries_before, entries_after,
+            "sorted directory entries must remain identical across capability probing"
+        );
+        assert_eq!(
+            content_before, expected_payload,
+            "content before probe must match initial fixture payload"
+        );
+        assert_eq!(
+            content_before, content_after,
+            "fixture file content must remain identical across capability probing"
+        );
+    }
+
+    #[test]
+    fn test_fs_metadata_head_succeeds_after_probe_capability() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_name = "verified_blob.bin";
+        let file_path = temp_dir.path().join(file_name);
+        let payload = b"verifiable payload for post-probe head inquiry";
+        std::fs::write(&file_path, payload).unwrap();
+
+        let reader = FsMetadataReader::open(temp_dir.path()).unwrap();
+
+        // 1. Probe capability succeeds synchronously on the caller thread
+        reader
+            .probe_capability()
+            .expect("capability probe must succeed on caller thread");
+
+        // 2. Head inquiry executes within an entered Tokio runtime
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let key = ObjectKey::parse(file_name).unwrap();
+        let meta = runtime
+            .block_on(async { reader.head(&key).await })
+            .expect("head must succeed on existing file after probe");
+
+        assert_eq!(
+            meta.size(),
+            payload.len() as u64,
+            "exact metadata size must match written payload length"
+        );
+
+        // Explicitly drop runtime and reader before fixture cleanup
+        drop(runtime);
+        drop(reader);
+        temp_dir.close().expect("fixture cleanup must succeed");
+    }
+
+    #[test]
+    fn test_fs_metadata_probe_capability_synthetic_openat2_classification() {
+        // ENOSYS -> FsMetadataError::SyscallUnsupported
+        let enosys = std::io::Error::from_raw_os_error(libc::ENOSYS);
+        let err_enosys = classify_openat2_probe_error(enosys);
+        match err_enosys {
+            FsMetadataError::SyscallUnsupported(src) => {
+                assert_eq!(src.raw_os_error(), Some(libc::ENOSYS));
+            }
+            other => panic!("expected SyscallUnsupported, got: {other:?}"),
+        }
+
+        // EACCES -> FsMetadataError::ProbeDenied (without inferring seccomp as unique cause)
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        let err_eacces = classify_openat2_probe_error(eacces);
+        match err_eacces {
+            FsMetadataError::ProbeDenied(src) => {
+                assert_eq!(src.raw_os_error(), Some(libc::EACCES));
+            }
+            other => panic!("expected ProbeDenied for EACCES, got: {other:?}"),
+        }
+
+        // EPERM -> FsMetadataError::ProbeDenied (without inferring seccomp as unique cause)
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        let err_eperm = classify_openat2_probe_error(eperm);
+        match err_eperm {
+            FsMetadataError::ProbeDenied(src) => {
+                assert_eq!(src.raw_os_error(), Some(libc::EPERM));
+            }
+            other => panic!("expected ProbeDenied for EPERM, got: {other:?}"),
+        }
+
+        // Other OS errors (e.g. EIO, EMFILE) -> FsMetadataError::ProbeFailed
+        let eio = std::io::Error::from_raw_os_error(libc::EIO);
+        let err_eio = classify_openat2_probe_error(eio);
+        match err_eio {
+            FsMetadataError::ProbeFailed { source } => {
+                assert_eq!(source.raw_os_error(), Some(libc::EIO));
+            }
+            other => panic!("expected ProbeFailed for EIO, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fs_metadata_probe_capability_synthetic_fstat_classification() {
+        // ENOSYS from fstat must map to ProbeFailed, NOT SyscallUnsupported
+        let enosys = std::io::Error::from_raw_os_error(libc::ENOSYS);
+        let err_enosys = classify_fstat_probe_error(enosys);
+        match err_enosys {
+            FsMetadataError::ProbeFailed { source } => {
+                assert_eq!(source.raw_os_error(), Some(libc::ENOSYS));
+            }
+            other => panic!("fstat ENOSYS must map to ProbeFailed, got: {other:?}"),
+        }
+
+        // EIO from fstat must map to ProbeFailed
+        let eio = std::io::Error::from_raw_os_error(libc::EIO);
+        let err_eio = classify_fstat_probe_error(eio);
+        match err_eio {
+            FsMetadataError::ProbeFailed { source } => {
+                assert_eq!(source.raw_os_error(), Some(libc::EIO));
+            }
+            other => panic!("fstat EIO must map to ProbeFailed, got: {other:?}"),
+        }
     }
 }
