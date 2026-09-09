@@ -8,6 +8,7 @@ description = "Domain-free core storage contracts and primitives"
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", default-features = false }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

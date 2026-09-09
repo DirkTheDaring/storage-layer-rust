@@ -1,19 +1,22 @@
-//! # `storage-core`
+//! Core storage domain types, traits, and error primitives.
 //!
-//! Domain-free core storage contracts and primitives.
+//! This crate defines minimal, abstract storage interfaces decoupling upper-layer
+//! registry services from concrete backend storage drivers.
 //!
-//! ## Architecture and Ownership Boundary
-//!
-//! `storage-core` defines low-level, domain-neutral storage abstractions:
-//! - [`ObjectKey`]: Strictly validated, lossless hierarchical object key syntax type.
-//! - [`ObjectMetadata`]: Minimal object metadata container preserving byte length.
+//! ## Core Primitives
+//! - [`ObjectKey`]: Strongly typed, normalized relative path key.
+//! - [`ObjectMetadata`]: Read-only metadata describing an object's size.
 //! - [`ObjectMetadataReader`]: Object-safe async trait for reading object metadata.
+//! - [`ObjectStream`]: Pinned, owned asynchronous byte stream trait object.
+//! - [`ObjectPayload`]: Carrier pairing object metadata with an active payload stream.
+//! - [`ObjectPayloadReader`]: Object-safe async trait for opening object payload streams.
 //! - [`ObjectKeyError`]: Strongly typed key syntax validation errors.
 //! - [`ReadError`]: Strongly typed read and metadata inquiry errors.
 //!
 //! ### Boundary Responsibilities
 //! - **Owned by `storage-core`**: Validated hierarchical key syntax, minimal object metadata,
-//!   and metadata-read contracts ([`ObjectMetadataReader`]).
+//!   metadata inquiry contracts ([`ObjectMetadataReader`]), and generic payload stream contracts
+//!   ([`ObjectPayloadReader`]).
 //! - **Owned by `registry-rust`**: Registry authentication and authorization, tenant and repository
 //!   namespace mapping, OCI descriptor and manifest semantics, HTTP request/response mappings,
 //!   and outward error translation.
@@ -29,4 +32,6 @@ pub mod read;
 
 pub use error::{ObjectKeyError, ReadError};
 pub use key::ObjectKey;
-pub use read::{ObjectMetadata, ObjectMetadataReader};
+pub use read::{
+    ObjectMetadata, ObjectMetadataReader, ObjectPayload, ObjectPayloadReader, ObjectStream,
+};
