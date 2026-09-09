@@ -1647,3 +1647,6 @@ mod linux_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod payload_acquisition_experiment;
