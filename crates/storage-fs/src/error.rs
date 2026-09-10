@@ -77,4 +77,37 @@ pub enum FsMetadataError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Failed to inspect descriptor metadata via `fstat` during payload acquisition.
+    #[error("failed to stat {stage} descriptor: {source}")]
+    StatFailed {
+        /// The acquisition stage (e.g. "Phase 1 contained" or "Phase 2 readable").
+        stage: &'static str,
+        /// Underlying I/O error from `fstat`.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Failed to reopen the descriptor via `/proc/self/fd` for reading.
+    #[error("failed to reopen descriptor via procfs: {source}")]
+    ProcfsReopenFailed {
+        /// Underlying I/O error from reopening.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The reopened descriptor in Phase 2 did not match the device and inode of the Phase 1 descriptor.
+    #[error(
+        "reopened descriptor identity mismatch: expected dev {expected_dev} ino {expected_ino}, got dev {actual_dev} ino {actual_ino}"
+    )]
+    IdentityMismatch {
+        /// Expected device number from Phase 1.
+        expected_dev: u64,
+        /// Expected inode number from Phase 1.
+        expected_ino: u64,
+        /// Actual device number from Phase 2.
+        actual_dev: u64,
+        /// Actual inode number from Phase 2.
+        actual_ino: u64,
+    },
 }

@@ -12,9 +12,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use storage_core::{ObjectKey, ObjectMetadata, ObjectMetadataReader, ReadError};
+use storage_core::{
+    ObjectKey, ObjectMetadata, ObjectMetadataReader, ObjectPayload, ObjectPayloadReader,
+    ObjectStream, ReadError,
+};
 
 use crate::error::FsMetadataError;
+
+pub(crate) mod payload;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use payload::PayloadTestHooks;
 
 #[cfg(all(test, target_os = "linux"))]
 type BeforeLookupHook = Arc<dyn Fn(&OwnedFd, &ObjectKey) + Send + Sync>;
@@ -59,9 +67,9 @@ impl TestHooks {
 /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
 ///
 /// # Execution Boundary and Concurrency
-/// - Potentially blocking filesystem operations (`openat2`, `fstat`) are executed
-///   on Tokio's blocking thread pool (`tokio::task::spawn_blocking`), ensuring the
-///   async caller's worker thread is not blocked by filesystem latency.
+/// - Potentially blocking filesystem operations (`openat2`, `fstat`, `/proc/self/fd` reopening)
+///   are offloaded to Tokio's blocking thread pool (`tokio::task::spawn_blocking`) to avoid
+///   stalling the async caller's worker thread during initial descriptor resolution.
 /// - Invoking [`head`](ObjectMetadataReader::head) requires being called within the context
 ///   of an entered Tokio runtime. If polled outside a Tokio runtime, the lookup fails immediately
 ///   with [`FsMetadataError::RuntimeMissing`] wrapped in [`ReadError::Backend`].
@@ -92,6 +100,8 @@ pub struct FsMetadataReader {
     root_fd: Arc<OwnedFd>,
     #[cfg(all(test, target_os = "linux"))]
     test_hooks: Option<TestHooks>,
+    #[cfg(all(test, target_os = "linux"))]
+    payload_test_hooks: Option<PayloadTestHooks>,
 }
 
 impl FsMetadataReader {
@@ -136,6 +146,8 @@ impl FsMetadataReader {
                 root_fd,
                 #[cfg(all(test, target_os = "linux"))]
                 test_hooks: None,
+                #[cfg(all(test, target_os = "linux"))]
+                payload_test_hooks: None,
             })
         }
 
@@ -224,6 +236,12 @@ impl FsMetadataReader {
         self.test_hooks = Some(hooks);
         self
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_payload_test_hooks(mut self, hooks: PayloadTestHooks) -> Self {
+        self.payload_test_hooks = Some(hooks);
+        self
+    }
 }
 
 #[async_trait]
@@ -271,6 +289,62 @@ impl ObjectMetadataReader for FsMetadataReader {
                 Ok(result) => result,
                 Err(join_err) => Err(ReadError::backend_with_source(
                     "blocking metadata lookup task failed",
+                    Box::new(FsMetadataError::TaskJoinFailed(join_err)),
+                )),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = key;
+            Err(ReadError::backend_with_source(
+                "platform unsupported: descriptor-relative containment requires Linux openat2",
+                Box::new(FsMetadataError::PlatformUnsupported),
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectPayloadReader for FsMetadataReader {
+    async fn open_payload(&self, key: &ObjectKey) -> Result<ObjectPayload, ReadError> {
+        #[cfg(target_os = "linux")]
+        {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    return Err(ReadError::backend_with_source(
+                        "tokio runtime required to execute blocking payload acquisition",
+                        Box::new(FsMetadataError::RuntimeMissing(err)),
+                    ));
+                }
+            };
+
+            let root_fd = Arc::clone(&self.root_fd);
+            let key = key.clone();
+            #[cfg(test)]
+            let payload_test_hooks = self.payload_test_hooks.clone();
+
+            let join_res = handle
+                .spawn_blocking(move || {
+                    payload::acquire_payload_sync(
+                        &root_fd,
+                        &key,
+                        #[cfg(test)]
+                        payload_test_hooks.as_ref(),
+                    )
+                })
+                .await;
+
+            match join_res {
+                Ok(Ok((metadata, std_file))) => {
+                    let tokio_file = tokio::fs::File::from_std(std_file);
+                    let stream: ObjectStream = Box::pin(tokio_file);
+                    Ok(ObjectPayload::new(metadata, stream))
+                }
+                Ok(Err(read_err)) => Err(read_err),
+                Err(join_err) => Err(ReadError::backend_with_source(
+                    "blocking payload acquisition task failed",
                     Box::new(FsMetadataError::TaskJoinFailed(join_err)),
                 )),
             }

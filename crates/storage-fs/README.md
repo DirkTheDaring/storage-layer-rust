@@ -1,11 +1,11 @@
 # `storage-fs`
 
-Standalone filesystem metadata reader implementing `storage_core::ObjectMetadataReader` over an owned, pinned directory descriptor.
+Standalone filesystem metadata and payload reader implementing `storage_core::ObjectMetadataReader` and `storage_core::ObjectPayloadReader` over an owned, pinned directory descriptor.
 
 ## 1. Architectural Boundaries
 
-- **`storage-core`**: Defines backend-neutral contracts (`ObjectKey`, `ObjectMetadata`, `ObjectMetadataReader`, `ReadError`).
-- **`storage-fs`**: Implements kernel-enforced descriptor-relative lookup on Linux (`openat2`), pinning the storage root directory and inspecting metadata without opening payload streams. Executes blocking filesystem calls on Tokio's blocking thread pool.
+- **`storage-core`**: Defines backend-neutral contracts (`ObjectKey`, `ObjectMetadata`, `ObjectMetadataReader`, `ObjectPayload`, `ObjectPayloadReader`, `ObjectStream`, `ReadError`).
+- **`storage-fs`**: Implements kernel-enforced descriptor-relative lookup on Linux (`openat2`), pinning the storage root directory and inspecting metadata or acquiring payload streams without uncontained pathname fallback. Executes blocking filesystem calls on Tokio's blocking thread pool.
 - **`registry-rust`**: Retains quarantine fallback orchestration, repository and blob namespace routing, and outward HTTP/OCI API compatibility translation.
 
 ## 2. Constructor, Namespace, and Lookup Semantics
@@ -25,12 +25,12 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
 - Syntax is validated by `ObjectKey` prior to any filesystem operation (rejecting empty input, leading/trailing/repeated slashes, `.`/`..` segments, backslashes, NUL, and control characters).
 
 ### Internal Blocking Execution Boundary (`tokio::task::spawn_blocking`)
-- Async metadata inquiry (`head(&self, key: &ObjectKey)`) requires an **entered Tokio runtime**. If polled outside a Tokio runtime context, lookup fails immediately with typed `ReadError::Backend` wrapping `FsMetadataError::RuntimeMissing`.
-- Potentially blocking filesystem operations (`openat2`, `fstat`) are offloaded to Tokio's blocking pool via `tokio::task::spawn_blocking`, ensuring the async caller's worker thread is never stalled by filesystem latency.
+- Async metadata inquiry (`head(&self, key: &ObjectKey)`) and payload opening (`open_payload(&self, key: &ObjectKey)`) require an **entered Tokio runtime**. If polled outside a Tokio runtime context, lookup fails immediately with typed `ReadError::Backend` wrapping `FsMetadataError::RuntimeMissing`.
+- Potentially blocking filesystem operations (`openat2`, `fstat`, `/proc/self/fd` reopening) are offloaded to Tokio's blocking pool via `tokio::task::spawn_blocking` to avoid stalling the caller's worker thread during initial descriptor acquisition. However, callers are not guaranteed that asynchronous tasks or worker threads will never experience filesystem latency, such as during stream polling, runtime task scheduling, or resource teardown.
 - Each blocking task holds an owned `Arc<OwnedFd>` reference to the pinned root directory descriptor and an owned, cloned `ObjectKey`.
 - Join failures (e.g. blocking task panics or runtime cancellations) are awaited and mapped to `ReadError::Backend` wrapping `FsMetadataError::TaskJoinFailed` while preserving the underlying `tokio::task::JoinError`.
 
-### Descriptor-Relative Lookup & Syscall Flags
+### Descriptor-Relative Metadata Lookup & Syscall Flags
 - Path resolution inside the blocking task uses Linux `openat2` beneath the pinned root directory descriptor:
   - `flags = O_PATH | O_CLOEXEC`
   - `resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`
@@ -39,16 +39,35 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
   - Enforces `st_mode & S_IFMT == S_IFREG`. Rejects non-regular objects (directories, FIFOs, symlinks, sockets, devices) at the application level as `FsMetadataError::UnsupportedObjectType` without reading payloads or blocking.
   - Converts `st_size` safely to `u64`.
 
+### Two-Phase Payload Acquisition (`open_payload`)
+Payload stream acquisition executes inside a single Tokio blocking task in two synchronous stages:
+1. **Phase 1: Contained Resolution & Type Validation**:
+   - Resolves `key` relative to the pinned `root_fd` using `openat2` with `O_PATH | O_CLOEXEC` and containment flags `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+   - The returned descriptor is immediately wrapped in an `OwnedFd`.
+   - `fstat` verifies that `st_mode & S_IFMT == S_IFREG`. Non-regular objects (directories, symlinks, FIFOs, sockets, device nodes) are rejected before any readable open.
+2. **Phase 2: Readable Reopening & Identity Verification**:
+   - While retaining the Phase 1 `OwnedFd`, `/proc/self/fd/{phase1_fd}` is opened with `O_RDONLY | O_CLOEXEC`.
+   - The resulting readable descriptor is immediately wrapped in an `OwnedFd`.
+   - `fstat` verifies that the readable descriptor is a regular file (`S_IFREG`) and matches the `st_dev` and `st_ino` observed in Phase 1.
+   - `st_size` is validated to be non-negative and converted to `u64` without narrowing.
+   - Returns an owned `std::fs::File` and `ObjectMetadata`.
+3. **Async Conversion**:
+   - Upon successful blocking task completion, the `std::fs::File` is converted into `tokio::fs::File::from_std(file)`, boxed, and pinned as `ObjectStream: Pin<Box<dyn AsyncRead + Send + 'static>>`.
+   - Paired with `ObjectMetadata` into an `ObjectPayload`.
+   - Stream consumption is decoupled from the reader and key lifetimes.
+
 ### Startup Capability Probing (`probe_capability`)
 - `FsMetadataReader::probe_capability(&self) -> Result<(), FsMetadataError>`
 - **API Boundary**: Explicit public backend-specific API on `FsMetadataReader` with a private syscall implementation.
 - **Execution Context**: Executes synchronously on the calling thread. It may block on filesystem operations and must **not** be called directly on an async executor worker thread.
-- **No Automatic Invocation**: No automatic invocation from `open` or `head` is introduced; downstream registry startup invocation (e.g. in `FsStorage::try_new`) remains deferred.
+- **No Automatic Invocation**: No automatic invocation from `open`, `head`, or `open_payload` is introduced; downstream registry startup invocation remains deferred.
 - **Narrow Success Definition**: Success indicates narrowly that the exact `"."` `openat2` lookup with flags `O_PATH | O_DIRECTORY | O_CLOEXEC` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, followed by directory metadata inspection (`fstat`), succeeded against the pinned root directory descriptor on the calling thread at that time.
 - **Immediate Cleanup**: The opened descriptor is immediately bound to `OwnedFd`, verified via `fstat` (`S_IFDIR`), and dropped immediately upon return, guaranteeing deterministic RAII closure.
 - **Contract Distinction**: `"."` is rejected as an `ObjectKey` by design (`ObjectKeyError::DotSegment`). `probe_capability` is a backend-private syscall probe on `FsMetadataReader` that operates directly on the pinned raw descriptor via the C string `c"."`; it does **not** construct an `ObjectKey` or route through regular-file `head`.
 
 ## 3. Error Classification and Contract Mapping
+
+### Metadata Inquiry (`head`) Error Mapping
 
 | Filesystem Condition | Underlying Cause | `storage-core` Contract Mapping | Error Category & Source |
 | :--- | :--- | :--- | :--- |
@@ -61,6 +80,24 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
 | **Ordinary I/O Error** | Other raw OS error (e.g. `EIO`) | `ReadError::Backend { message, source }` | `source` wraps causal `std::io::Error`. |
 | **Missing Runtime** | Polled outside an entered Tokio runtime | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::RuntimeMissing`. Diagnostic message: `"tokio runtime required to execute blocking metadata lookup"`. |
 | **Task Join Failure** | Blocking task panicked or cancelled during shutdown | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::TaskJoinFailed`. Causal `tokio::task::JoinError` preserved. |
+
+### Payload Acquisition (`open_payload`) Error Mapping
+
+| Acquisition Condition | Underlying Cause | `storage-core` Contract Mapping | Error Category & Source |
+| :--- | :--- | :--- | :--- |
+| **Object Missing** | Phase 1 `openat2` returns `ENOENT` | `ReadError::NotFound { key }` | Genuine OS `ENOENT`. |
+| **Resolution Permission Denial** | Phase 1 `openat2` returns `EACCES` or `EPERM` | `ReadError::PermissionDenied { key, source }` | Authentic OS permission failure boxed as `source`. |
+| **Resolution Rejected** | Phase 1 `openat2` returns `ELOOP` or `EXDEV` | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::ResolutionRejected`. Never mapped to `NotFound`. |
+| **Unsupported Object Type** | Phase 1 or Phase 2 object is non-regular | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::UnsupportedObjectType`. |
+| **Phase 1 Stat Failure** | Phase 1 `fstat` fails | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::StatFailed { stage: "Phase 1 contained", source }`. |
+| **Procfs Reopen Failure** | Opening `/proc/self/fd/N` fails (e.g. procfs unavailable, `ENOENT`, `EACCES`, `EPERM`) | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::ProcfsReopenFailed { source }`. Phase 2 `ENOENT` is **never** mapped to `NotFound`; Phase 2 permission errors are **never** mapped to `PermissionDenied`. |
+| **Phase 2 Stat Failure** | Phase 2 `fstat` fails | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::StatFailed { stage: "Phase 2 readable", source }`. |
+| **Identity Mismatch** | Reopened descriptor `st_dev` or `st_ino` differs from Phase 1 | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::IdentityMismatch`. |
+| **Syscall Unavailable** | Phase 1 `openat2` returns `ENOSYS` | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::SyscallUnsupported`. |
+| **Invalid Metadata** | Negative `st_size` or size conversion failure | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::InvalidMetadata`. |
+| **Missing Runtime** | Polled outside an entered Tokio runtime | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::RuntimeMissing`. Diagnostic message: `"tokio runtime required to execute blocking payload acquisition"`. |
+| **Task Join Failure** | Blocking task panicked or cancelled during shutdown | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::TaskJoinFailed`. |
+| **Subsequent Stream Error** | Stream read failure after acquisition completes | `std::io::Error` | Delivered directly through `tokio::io::AsyncRead`, never mapped to `ReadError`. |
 
 ### Capability Probe Error Classification
 
@@ -77,31 +114,39 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
 
 ## 4. Guarantees and Limitations
 
-1. **Metadata-Only Inquiry**:
-   - `O_PATH` metadata inspection queries file existence, object type, and size without opening the file for reading.
-   - It does **not** prove that read permissions would be granted for payload streams (`O_RDONLY`), nor does it establish legacy permission semantics.
-2. **Cancellation and Lifecycle Semantics**:
-   - Dropping or cancelling the awaiting future returned by `head` does **not** abort or stop blocking work that has already started on Tokio's blocking thread pool.
-   - Owned task state (`Arc<OwnedFd>`) guarantees descriptor validity: even if the reader or caller future is dropped, the root descriptor remains valid until the in-flight blocking task completes, preventing `EBADF`.
-   - Runtime shutdown and unresponsive filesystem stalls (e.g. hung network filesystems) retain standard blocking-task limitations; userspace cannot guarantee bounded syscall completion.
-3. **Mount Crossings**:
-   - `RESOLVE_BENEATH` does **not** prohibit mount crossings beneath the root.
-   - `RESOLVE_NO_XDEV` is the separate Linux flag that disallows mount point traversal (including bind mounts); this crate does not enable it. Mount policy remains a later decision.
-4. **Hard Links**:
-   - Hard links inside the root pointing to external data share the same inode; `openat2` cannot eliminate hard-link aliasing.
-5. **Concurrent Renaming**:
-   - The kernel enforces lookup constraints during path resolution.
-   - Root pinning binds all subsequent lookups to the originally acquired directory inode.
-   - However, root pinning does not establish general immunity to every concurrent filesystem change: an opened object can subsequently be renamed outside the root by concurrent processes.
-6. **Platform Support**:
+1. **Metadata vs. Payload Acquisition**:
+   - `head` inspects metadata via `O_PATH` without opening readable file handles or verifying read permissions.
+   - `open_payload` uses two-phase acquisition: Phase 1 contained resolution (`O_PATH`) and type validation, followed by Phase 2 readable reopening (`O_RDONLY`) via `/proc/self/fd/N`.
+2. **Explicit Procfs Trust Assumption**:
+   - Supported only under the documented assumption that `/proc/self/fd` is genuine, accessible, and stable during acquisition.
+   - Formatting a descriptor pathname does not verify procfs authenticity.
+   - The post-open `st_dev`/`st_ino` identity check detects target substitutions, but cannot prevent kernel side effects that occur during the `open` call itself if `/proc` were compromised or attacker-controlled.
+   - Procfs trust and availability are prerequisites for any future registry cutover.
+3. **Same-Object Identity vs. Immutable Content**:
+   - The Phase 2 identity verification ensures that the readable descriptor points to the identical inode (`st_dev` and `st_ino`) verified during Phase 1.
+   - This identity check does **not** guarantee immutable content or agreement between separate `head` and `open_payload` calls under concurrent backend modification, truncation, or replacement.
+4. **Shared Root Ownership**:
+   - The pinned `Arc<OwnedFd>` is shared across all metadata and payload operations.
+   - Lookups remain tied to the originally opened root directory inode even if the root pathname is moved, renamed, or unlinked.
+   - However, shared root ownership does not solve pathname-based writes, concurrent uncontained mutations, or deduplication divergence.
+5. **Decoupled Stream Lifecycle & Deferred Closure**:
+   - The returned `ObjectPayload` and its inner stream own their file descriptors independently of the `FsMetadataReader` and `ObjectKey`. Dropping the reader or key leaves in-flight streams fully operational, provided their required Tokio runtime remains active.
+   - Outstanding I/O operations can retain the underlying file handle and delay descriptor closure; no particular cleanup thread or instantaneous descriptor release is guaranteed upon stream drop.
+6. **Cancellation and Lifecycle Semantics**:
+   - Dropping or cancelling the awaiting future returned by `head` or `open_payload` does **not** abort or interrupt blocking work already in flight on Tokio's blocking thread pool.
+   - Owned task state (`Arc<OwnedFd>`) guarantees descriptor validity: the descriptors remain open until the in-flight task completes, preventing `EBADF` or premature reuse.
+7. **Mount Crossings & Hard Links**:
+   - `RESOLVE_BENEATH` does **not** prohibit mount crossings beneath the root (disallowing mount crossings requires `RESOLVE_NO_XDEV`, which is not enabled).
+   - Hard links pointing to data inside or outside the root share the same inode; `openat2` cannot eliminate hard-link aliasing.
+8. **Platform Support**:
    - Descriptor-relative containment requires Linux `openat2`.
-   - If `openat2` returns `ENOSYS`, `storage-fs` fails closed with diagnostic `"openat2 is unavailable in this execution environment"`. It does not infer a host kernel version from `ENOSYS` alone, nor does it attempt an insecure path-based fallback.
+   - If `openat2` returns `ENOSYS`, `storage-fs` fails closed with diagnostic `"openat2 is unavailable in this execution environment"`.
    - On non-Linux platforms, operations fail explicitly with `FsMetadataError::PlatformUnsupported`. Non-Linux compilation and execution remain unverified in the absence of a cross-compilation toolchain.
-7. **Capability Probe Guarantees and Limitations**:
+9. **Capability Probe Guarantees and Limitations**:
    - **Narrow Scope of Success**:
      - Success establishes only that the exact `"."` `openat2` lookup with the specified containment flags and directory metadata inspection succeeded against the pinned root descriptor on the calling thread at that time.
    - **Properties NOT Established**:
-     1. Does not establish equivalent permissions or syscall filtering on Tokio blocking-pool threads.
+     1. Does not establish equivalent permissions or syscall filtering on Tokio blocking-pool threads or future worker threads.
      2. Does not verify that child paths, subdirectories, or blobs exist or can be created.
      3. Does not exercise multi-component path resolution across nested subdirectories.
      4. Does not verify regular-file lookup (`S_IFREG`), because `"."` is a directory (`S_IFDIR`).
@@ -109,10 +154,5 @@ Standalone filesystem metadata reader implementing `storage_core::ObjectMetadata
      6. Does not establish root coherence across pathname-based reads and mutations.
      7. Does not establish future availability or guarantee against dynamic runtime reconfiguration (e.g. late seccomp filter installation, filesystem remounts, or storage media failures).
      8. Does not close quality gate **O-05** or establish production readiness.
-   - **Syscall Availability Interpretation**:
-     - If `openat2` returns `ENOSYS`, the probe reports `FsMetadataError::SyscallUnsupported`. It does not infer a specific kernel version from `ENOSYS` alone.
-   - **Execution Context & Latency**:
-     - Synchronous execution on the caller thread avoids requiring an entered Tokio runtime or thread pool dispatch during early application startup.
-     - Limitation: because it is synchronous, if the root directory resides on an unresponsive or stalled network filesystem (NFS/FUSE), the calling startup thread can block indefinitely, identically to `FsMetadataReader::open`. It must not be called directly on an async executor worker thread.
-8. **Open Quality Gates**:
-   - Gate **O-05** remains **OPEN**: this crate implements an isolated metadata reader. Production registry integration, quarantine orchestration, outward HTTP compatibility, and distribution gates remain deferred.
+10. **Open Quality Gates**:
+   - Quality gates **O-05**, **O-03**, **O-06**, **O-13**, **O-16**, and **D-06** remain **OPEN**: this crate implements standalone metadata and payload reader ports. Registry callers, production routing, range reads, seeking, directory listings, mutations, quarantine integration, and production cutover are not authorized in this slice.
