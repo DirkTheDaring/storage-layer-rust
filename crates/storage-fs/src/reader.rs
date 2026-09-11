@@ -102,6 +102,8 @@ pub struct FsMetadataReader {
     test_hooks: Option<TestHooks>,
     #[cfg(all(test, target_os = "linux"))]
     payload_test_hooks: Option<PayloadTestHooks>,
+    #[cfg(all(test, target_os = "linux"))]
+    dir_test_hooks: Option<crate::dir::DirTestHooks>,
 }
 
 impl FsMetadataReader {
@@ -148,6 +150,8 @@ impl FsMetadataReader {
                 test_hooks: None,
                 #[cfg(all(test, target_os = "linux"))]
                 payload_test_hooks: None,
+                #[cfg(all(test, target_os = "linux"))]
+                dir_test_hooks: None,
             })
         }
 
@@ -241,6 +245,58 @@ impl FsMetadataReader {
     pub(crate) fn with_payload_test_hooks(mut self, hooks: PayloadTestHooks) -> Self {
         self.payload_test_hooks = Some(hooks);
         self
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_dir_test_hooks(mut self, hooks: crate::dir::DirTestHooks) -> Self {
+        self.dir_test_hooks = Some(hooks);
+        self
+    }
+
+    /// Bounded, descriptor-relative directory enumeration over the pinned root descriptor.
+    ///
+    /// Resolves `target` relative to the pinned root directory descriptor using Linux `openat2`
+    /// with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, and collects directory
+    /// entries up to the caller-specified resource limits.
+    ///
+    /// # Target Resolution
+    /// - `target: None` targets the pinned root directory itself (`"."`).
+    /// - `target: Some(key)` targets a verified relative subdirectory path beneath the root.
+    ///
+    /// # Resource Accounting & Zero-Limit Semantics
+    /// Caller-supplied [`DirEnumerationLimits`](crate::dir::DirEnumerationLimits) constrain the maximum
+    /// returned entries and cumulative name bytes. An empty directory succeeds under zero limits;
+    /// if non-empty, the first entry exceeding either budget fails closed with
+    /// [`FsDirError::LimitExceeded`](crate::dir::FsDirError::LimitExceeded) without partial results.
+    ///
+    /// # Observation Semantics
+    /// Returned [`DirEntryType`](crate::dir::DirEntryType) values are point-in-time observations during iteration,
+    /// not capabilities authorizing subsequent pathname access.
+    ///
+    /// # Platform Support
+    /// Requires Linux `openat2`. On non-Linux platforms, returns [`FsDirError::PlatformUnsupported`](crate::dir::FsDirError::PlatformUnsupported).
+    pub async fn enumerate_dir(
+        &self,
+        target: Option<&ObjectKey>,
+        limits: crate::dir::DirEnumerationLimits,
+    ) -> Result<Vec<crate::dir::DirEntry>, crate::dir::FsDirError> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::dir::enumerate_dir_async(
+                &self.root_fd,
+                target,
+                limits,
+                #[cfg(test)]
+                self.dir_test_hooks.as_ref(),
+            )
+            .await
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (target, limits);
+            Err(crate::dir::FsDirError::PlatformUnsupported)
+        }
     }
 }
 

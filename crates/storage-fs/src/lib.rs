@@ -60,6 +60,22 @@
 //! Outstanding I/O operations can retain the underlying file handle and delay descriptor closure; no particular
 //! cleanup thread or instantaneous descriptor release is guaranteed upon stream drop.
 //!
+//! ## Bounded Directory Enumeration
+//! - Single-directory enumeration ([`enumerate_dir`](reader::FsMetadataReader::enumerate_dir)) operates over the pinned
+//!   root descriptor using Linux `openat2` with containment flags:
+//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+//! - Resolves root (`None`) via `"."` and subdirectories (`Some(key)`) with identical containment flags.
+//! - Callers must provide explicit [`DirEnumerationLimits`](dir::DirEnumerationLimits) bounding maximum entries and cumulative name bytes.
+//! - **Zero-Limit Semantics**: An empty directory succeeds under zero limits; if non-empty, the first entry exceeding either budget
+//!   fails closed with [`FsDirError::LimitExceeded`](dir::FsDirError::LimitExceeded) without partial results.
+//! - **Resource Bounds Scope**: Limits bound retained entry counts and raw name bytes in userspace heap memory. They do not bound
+//!   allocator overhead, kernel dentries/inodes, libc internal buffers, concurrent tasks, or blocking syscall duration.
+//! - **Cancellation**: Dropping the awaiting future does not cancel in-flight blocking kernel I/O.
+//! - **Observations, Not Capabilities**: Returned [`DirEntryType`](dir::DirEntryType) values are point-in-time observations during iteration,
+//!   not capabilities authorizing subsequent pathname access.
+//! - **Non-Guarantees**: Directory iteration does not provide snapshot isolation. Moving or unlinking a directory does not guarantee
+//!   successful iteration. Mount crossing is not prohibited by these flags; no mount isolation is claimed.
+//!
 //! ## Error Model Demarcation
 //! - In `head` metadata inquiries, Phase 1 resolution errors map to [`ReadError::NotFound`](storage_core::ReadError::NotFound),
 //!   [`ReadError::PermissionDenied`](storage_core::ReadError::PermissionDenied), or [`ReadError::Backend`](storage_core::ReadError::Backend).
@@ -71,15 +87,20 @@
 //!     reported as `NotFound`, and Phase 2 permission errors are **never** reported as `PermissionDenied`.
 //!   - Reopened descriptor identity mismatches map to [`FsMetadataError::IdentityMismatch`].
 //!   - Stream reading failures occurring after acquisition are delivered as [`std::io::Error`] through `AsyncRead`.
+//! - In `enumerate_dir` inquiries, errors map to strongly typed [`FsDirError`](dir::FsDirError) variants distinguishing missing targets,
+//!   non-directory targets, permission denial, kernel containment rejections, budget limits, disappeared entries during inspection,
+//!   runtime absence, and I/O failures.
 //!
 //! ## Open Quality Gates
 //! Quality gates **O-05**, **O-03**, **O-06**, **O-13**, **O-16**, and **D-06** remain **OPEN**:
-//! this crate implements standalone metadata and payload reader ports. Registry callers, production routing,
-//! range reads, seeking, directory listings, mutations, quarantine integration, and production cutover are not
+//! this crate implements standalone metadata, payload, and directory reader operations. Registry callers, production routing,
+//! range reads, seeking, CAS listing integration, mutations, quarantine integration, and production cutover are not
 //! authorized in this slice.
 
+pub mod dir;
 pub mod error;
 pub mod reader;
 
+pub use dir::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError, LimitExceededReason};
 pub use error::FsMetadataError;
 pub use reader::FsMetadataReader;
