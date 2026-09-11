@@ -19,7 +19,10 @@ use storage_core::{
 
 use crate::error::FsMetadataError;
 
+pub(crate) mod inspect;
 pub(crate) mod payload;
+
+pub use inspect::FsFileMetadata;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use payload::PayloadTestHooks;
@@ -104,6 +107,8 @@ pub struct FsMetadataReader {
     payload_test_hooks: Option<PayloadTestHooks>,
     #[cfg(all(test, target_os = "linux"))]
     dir_test_hooks: Option<crate::dir::DirTestHooks>,
+    #[cfg(all(test, target_os = "linux"))]
+    inspect_test_hooks: Option<inspect::InspectTestHooks>,
 }
 
 impl FsMetadataReader {
@@ -152,6 +157,8 @@ impl FsMetadataReader {
                 payload_test_hooks: None,
                 #[cfg(all(test, target_os = "linux"))]
                 dir_test_hooks: None,
+                #[cfg(all(test, target_os = "linux"))]
+                inspect_test_hooks: None,
             })
         }
 
@@ -253,6 +260,12 @@ impl FsMetadataReader {
         self
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_inspect_test_hooks(mut self, hooks: inspect::InspectTestHooks) -> Self {
+        self.inspect_test_hooks = Some(hooks);
+        self
+    }
+
     /// Bounded, descriptor-relative directory enumeration over the pinned root descriptor.
     ///
     /// Resolves `target` relative to the pinned root directory descriptor using Linux `openat2`
@@ -296,6 +309,86 @@ impl FsMetadataReader {
         {
             let _ = (target, limits);
             Err(crate::dir::FsDirError::PlatformUnsupported)
+        }
+    }
+
+    /// Descriptor-relative inspection of filesystem attributes beneath the pinned root.
+    ///
+    /// Resolves `key` beneath the pinned root directory descriptor via Linux `openat2` with:
+    /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`
+    /// and queries attributes via `fstat` after descriptor acquisition.
+    ///
+    /// # Error Classification & Boundaries
+    /// - Symlinks encountered during resolution are rejected with [`crate::error::FsMetadataError::ResolutionRejected`].
+    /// - Only regular files (`S_IFREG`) succeed; acquired non-regular objects (directories, FIFOs,
+    ///   character/block devices, sockets) reject with [`crate::error::FsMetadataError::UnsupportedObjectType`].
+    ///
+    /// # Observation Semantics
+    /// - Attributes are observed by `fstat` after descriptor acquisition, not at the instant of `openat2` resolution.
+    /// - One `fstat` result does not guarantee an atomic snapshot of all attributes under concurrent mutation.
+    ///
+    /// # Platform Support
+    /// Requires Linux `openat2`. On non-Linux platforms, returns
+    /// [`ReadError::Backend`] wrapping [`FsMetadataError::PlatformUnsupported`].
+    /// Non-Linux compilation and execution remain unverified in the absence of a cross-compilation environment.
+    pub async fn inspect_file_metadata(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<FsFileMetadata, ReadError> {
+        #[cfg(target_os = "linux")]
+        {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(ReadError::backend_with_source(
+                        "tokio runtime required to execute blocking metadata inspection",
+                        Box::new(FsMetadataError::RuntimeMissing(e)),
+                    ));
+                }
+            };
+
+            let root_fd = Arc::clone(&self.root_fd);
+            let key = key.clone();
+            #[cfg(test)]
+            let inspect_test_hooks = self.inspect_test_hooks.clone();
+
+            let join_res = handle
+                .spawn_blocking(move || {
+                    let res = inspect::inspect_file_metadata_sync(
+                        &root_fd,
+                        &key,
+                        #[cfg(test)]
+                        inspect_test_hooks.as_ref(),
+                    );
+
+                    #[cfg(test)]
+                    if let Some(on_complete) = inspect_test_hooks
+                        .as_ref()
+                        .and_then(|h| h.on_complete.as_ref())
+                    {
+                        on_complete(res.as_ref());
+                    }
+
+                    res
+                })
+                .await;
+
+            match join_res {
+                Ok(result) => result,
+                Err(join_err) => Err(ReadError::backend_with_source(
+                    "blocking metadata inspection task failed",
+                    Box::new(FsMetadataError::TaskJoinFailed(join_err)),
+                )),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = key;
+            Err(ReadError::backend_with_source(
+                "platform unsupported: descriptor-relative containment requires Linux openat2",
+                Box::new(FsMetadataError::PlatformUnsupported),
+            ))
         }
     }
 }
@@ -621,6 +714,19 @@ mod non_linux_tests {
             .probe_capability()
             .expect_err("must fail on non-linux");
         assert!(matches!(err, FsMetadataError::PlatformUnsupported));
+    }
+
+    #[tokio::test]
+    async fn test_fs_metadata_non_linux_inspect_file_metadata_platform_unsupported() {
+        let reader = FsMetadataReader {
+            root_path: PathBuf::from("nonempty_path"),
+        };
+        let key = ObjectKey::parse("test.bin").unwrap();
+        let err = reader
+            .inspect_file_metadata(&key)
+            .await
+            .expect_err("must fail on non-linux");
+        assert!(err.is_backend());
     }
 }
 

@@ -35,9 +35,23 @@ Standalone filesystem metadata and payload reader implementing `storage_core::Ob
   - `flags = O_PATH | O_CLOEXEC`
   - `resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`
 - The resulting descriptor is immediately wrapped in `OwnedFd` to ensure deterministic RAII cleanup on all code paths.
-- The descriptor is inspected via `fstat`:
-  - Enforces `st_mode & S_IFMT == S_IFREG`. Rejects non-regular objects (directories, FIFOs, symlinks, sockets, devices) at the application level as `FsMetadataError::UnsupportedObjectType` without reading payloads or blocking.
+- Symlinks encountered during resolution are rejected with `FsMetadataError::ResolutionRejected` (`ELOOP` / `EXDEV`).
+- The descriptor is inspected via `fstat` after acquisition:
+  - Enforces `st_mode & S_IFMT == S_IFREG`. Rejects acquired non-regular objects (directories, FIFOs, sockets, devices) at the application level as `FsMetadataError::UnsupportedObjectType` without reading payloads or blocking.
   - Converts `st_size` safely to `u64`.
+
+### Contained File Metadata Inspection (`inspect_file_metadata`)
+- `FsMetadataReader::inspect_file_metadata(&self, key: &ObjectKey) -> Result<FsFileMetadata, ReadError>`
+- Resolves `key` beneath the pinned `root_fd` using Linux `openat2` with `O_PATH | O_CLOEXEC` and containment flags
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+- Symlinks encountered during resolution are rejected with `FsMetadataError::ResolutionRejected`.
+- Wraps descriptor immediately in `OwnedFd` and inspects attributes via `fstat` after descriptor acquisition (not at the instant of `openat2` resolution).
+- Strictly validates `st_mode & S_IFMT == S_IFREG`; acquired non-regular objects (directories, FIFOs, sockets, devices)
+  are rejected as `FsMetadataError::UnsupportedObjectType`.
+- Converts `st_size` safely to `u64`.
+- Converts `st_mtime` and `st_mtime_nsec` into `SystemTime` using checked arithmetic, avoiding signed-minimum overflow.
+- Returns `FsFileMetadata` holding `size: u64` and `modified: Option<SystemTime>`. Successful Linux `fstat` inspection returns `Some(timestamp)`.
+- **Observation Semantics & Mutation**: Attributes are observed by `fstat` after descriptor acquisition. One stat result does not guarantee an atomic snapshot of all attributes under concurrent mutation, nor does it guarantee snapshot isolation across multiple operations.
 
 ### Two-Phase Payload Acquisition (`open_payload`)
 Payload stream acquisition executes inside a single Tokio blocking task in two synchronous stages:
@@ -74,12 +88,28 @@ Payload stream acquisition executes inside a single Tokio blocking task in two s
 | **Object Missing** | `openat2` returns `ENOENT` | `ReadError::NotFound { key }` | Genuine OS `ENOENT`. |
 | **Permission Denial** | `openat2` or `fstat` returns `EACCES` or `EPERM` | `ReadError::PermissionDenied { key, source }` | Authentic OS permission failure boxed as `source`. |
 | **Resolution Rejected** | `openat2` returns `ELOOP` (symlink) or `EXDEV` (boundary escape) | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::ResolutionRejected`. Never mapped to `NotFound`. |
-| **Unsupported Object Type** | Opened object is non-regular (`S_IFDIR`, `S_IFIFO`, `S_IFLNK`, etc.) | `ReadError::Backend { message, source }` | Source-free application-level rejection wrapping `FsMetadataError::UnsupportedObjectType`. |
+| **Unsupported Object Type** | Acquired object is non-regular (`S_IFDIR`, `S_IFIFO`, `S_IFBLK`, etc.) | `ReadError::Backend { message, source }` | Source-free application-level rejection wrapping `FsMetadataError::UnsupportedObjectType`. |
 | **Syscall Unavailable** | `openat2` returns `ENOSYS` | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::SyscallUnsupported`. Diagnostic message: `"openat2 is unavailable in this execution environment"`. |
 | **Invalid Metadata** | Negative `st_size` or size conversion failure | `ReadError::Backend { message, source }` | Application validation error wrapping `FsMetadataError::InvalidMetadata`. |
 | **Ordinary I/O Error** | Other raw OS error (e.g. `EIO`) | `ReadError::Backend { message, source }` | `source` wraps causal `std::io::Error`. |
 | **Missing Runtime** | Polled outside an entered Tokio runtime | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::RuntimeMissing`. Diagnostic message: `"tokio runtime required to execute blocking metadata lookup"`. |
 | **Task Join Failure** | Blocking task panicked or cancelled during shutdown | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::TaskJoinFailed`. Causal `tokio::task::JoinError` preserved. |
+
+### File Metadata Inspection (`inspect_file_metadata`) Error Mapping
+
+| Inspection Condition | Underlying Cause | `storage-core` Contract Mapping | Error Category & Source |
+| :--- | :--- | :--- | :--- |
+| **Object Missing** | `openat2` returns `ENOENT` | `ReadError::NotFound { key }` | Genuine OS `ENOENT`. |
+| **Resolution Permission Denial** | `openat2` returns `EACCES` or `EPERM` | `ReadError::PermissionDenied { key, source }` | Authentic OS permission failure boxed as `source`. |
+| **Resolution Rejected** | `openat2` returns `ELOOP` (symlink) or `EXDEV` (boundary escape) | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::ResolutionRejected`. Never mapped to `NotFound`. |
+| **Unsupported Object Type** | Acquired object is non-regular (`S_IFDIR`, `S_IFIFO`, `S_IFBLK`, etc.) | `ReadError::Backend { message, source }` | Source-free application-level rejection wrapping `FsMetadataError::UnsupportedObjectType`. |
+| **Stat Failure** | `fstat` syscall fails | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::StatFailed { stage: "file inspection", source }`. |
+| **Syscall Unavailable** | `openat2` returns `ENOSYS` | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::SyscallUnsupported`. |
+| **Invalid Metadata** | Negative `st_size` or invalid timestamp nanoseconds/overflow | `ReadError::Backend { message, source }` | Application validation error wrapping `FsMetadataError::InvalidMetadata`. |
+| **Ordinary Resolution Error** | Other raw OS error (e.g. `ENOTDIR`) | `ReadError::Backend { message, source }` | `source` wraps causal `std::io::Error`. |
+| **Missing Runtime** | Polled outside an entered Tokio runtime | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::RuntimeMissing`. |
+| **Task Join Failure** | Blocking task panicked or cancelled during shutdown | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::TaskJoinFailed`. |
+| **Unsupported Platform** | Target platform is not Linux | `ReadError::Backend { message, source }` | `source` wraps `FsMetadataError::PlatformUnsupported`. |
 
 ### Payload Acquisition (`open_payload`) Error Mapping
 
@@ -141,7 +171,7 @@ Payload stream acquisition executes inside a single Tokio blocking task in two s
 8. **Platform Support**:
    - Descriptor-relative containment requires Linux `openat2`.
    - If `openat2` returns `ENOSYS`, `storage-fs` fails closed with diagnostic `"openat2 is unavailable in this execution environment"`.
-   - On non-Linux platforms, operations fail explicitly with `FsMetadataError::PlatformUnsupported`. Non-Linux compilation and execution remain unverified in the absence of a cross-compilation toolchain.
+   - On non-Linux platforms, operations fail explicitly with `FsMetadataError::PlatformUnsupported`. Non-Linux compilation and execution remain unverified in the absence of a cross-compilation environment.
 9. **Capability Probe Guarantees and Limitations**:
    - **Narrow Scope of Success**:
      - Success establishes only that the exact `"."` `openat2` lookup with the specified containment flags and directory metadata inspection succeeded against the pinned root descriptor on the calling thread at that time.
@@ -154,5 +184,9 @@ Payload stream acquisition executes inside a single Tokio blocking task in two s
      6. Does not establish root coherence across pathname-based reads and mutations.
      7. Does not establish future availability or guarantee against dynamic runtime reconfiguration (e.g. late seccomp filter installation, filesystem remounts, or storage media failures).
      8. Does not close quality gate **O-05** or establish production readiness.
-10. **Open Quality Gates**:
-   - Quality gates **O-05**, **O-03**, **O-06**, **O-13**, **O-16**, and **D-06** remain **OPEN**: this crate implements standalone metadata and payload reader ports. Registry callers, production routing, range reads, seeking, directory listings, mutations, quarantine integration, and production cutover are not authorized in this slice.
+10. **Metadata Inspection Observation Semantics & Non-Guarantees**:
+    - **Observation After Acquisition**: Attributes are observed by `fstat` on the acquired descriptor after acquisition, not at the instant of `openat2` path resolution.
+    - **No Atomic Snapshot Under Mutation**: A single `fstat` result does not guarantee an atomic snapshot of all attributes under concurrent mutation, nor does it guarantee snapshot isolation across multiple operations.
+    - **Replacement Before Inspection**: If a file is replaced before inspection, inspection observes the replacement file's attributes at resolution time; this demonstrates observation at resolution time, not snapshot isolation or detection of every concurrent replacement.
+11. **Open Quality Gates**:
+    - Quality gates **O-05**, **O-03**, **O-06**, **O-13**, **O-16**, and **D-06** remain **OPEN**: this crate implements standalone metadata and payload reader ports. Registry callers, production routing, range reads, seeking, directory listings, mutations, quarantine integration, and production cutover are not authorized in this slice.

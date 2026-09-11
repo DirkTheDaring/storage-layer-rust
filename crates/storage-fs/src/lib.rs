@@ -14,8 +14,9 @@
 //!   HTTP/OCI API compatibility translation.
 //!
 //! ## Execution Boundary and Latency
-//! - Async metadata inquiry ([`head`](reader::FsMetadataReader::head)) and payload opening
-//!   ([`open_payload`](storage_core::ObjectPayloadReader::open_payload)) offload initial blocking filesystem
+//! - Async metadata inquiry ([`head`](reader::FsMetadataReader::head)), payload opening
+//!   ([`open_payload`](storage_core::ObjectPayloadReader::open_payload)), and file metadata inspection
+//!   ([`inspect_file_metadata`](reader::FsMetadataReader::inspect_file_metadata)) offload initial blocking filesystem
 //!   syscalls (`openat2`, `fstat`, `/proc/self/fd` reopening) to Tokio's blocking pool
 //!   (`tokio::task::spawn_blocking`) and require an entered Tokio runtime.
 //! - Offloading to `spawn_blocking` avoids stalling worker threads during initial descriptor resolution,
@@ -76,9 +77,30 @@
 //! - **Non-Guarantees**: Directory iteration does not provide snapshot isolation. Moving or unlinking a directory does not guarantee
 //!   successful iteration. Mount crossing is not prohibited by these flags; no mount isolation is claimed.
 //!
+//! ## Contained File Metadata Inspection
+//! - Single-file metadata inspection ([`inspect_file_metadata`](reader::FsMetadataReader::inspect_file_metadata))
+//!   resolves `key` relative to the pinned root directory descriptor using Linux `openat2` with:
+//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+//! - **Observation After Acquisition**: Attributes are observed by `fstat` on the acquired descriptor after acquisition,
+//!   not at the instant of `openat2` path resolution.
+//! - **No Atomic Snapshot Under Mutation**: A single `fstat` result does not guarantee an atomic snapshot of all attributes
+//!   under concurrent mutation, nor does it guarantee snapshot isolation across multiple operations.
+//! - **Platform Verification**: Descriptor-relative containment requires Linux `openat2`. Non-Linux platforms return
+//!   typed `PlatformUnsupported`; non-Linux compilation and execution remain unverified in the absence of a cross-compilation environment.
+//!
 //! ## Error Model Demarcation
 //! - In `head` metadata inquiries, Phase 1 resolution errors map to [`ReadError::NotFound`](storage_core::ReadError::NotFound),
 //!   [`ReadError::PermissionDenied`](storage_core::ReadError::PermissionDenied), or [`ReadError::Backend`](storage_core::ReadError::Backend).
+//! - In `inspect_file_metadata` inquiries:
+//!   - Resolution `ENOENT` maps to [`ReadError::NotFound`](storage_core::ReadError::NotFound).
+//!   - Resolution `EACCES`/`EPERM` maps to [`ReadError::PermissionDenied`](storage_core::ReadError::PermissionDenied).
+//!   - Symlinks encountered during resolution (`ELOOP`/`EXDEV`) map to [`ReadError::Backend`](storage_core::ReadError::Backend)
+//!     wrapping [`FsMetadataError::ResolutionRejected`].
+//!   - `openat2` `ENOSYS` maps to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::SyscallUnsupported`].
+//!   - `fstat` failure maps to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::StatFailed`].
+//!   - Acquired non-regular objects (directories, FIFOs, character/block devices, sockets) map to
+//!     [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::UnsupportedObjectType`].
+//!   - Invalid size or timestamp fields map to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::InvalidMetadata`].
 //! - In `open_payload` acquisitions, errors are partitioned into distinct stages:
 //!   - Phase 1 resolution uses typed resolution classification.
 //!   - Non-regular files reject via [`FsMetadataError::UnsupportedObjectType`].
@@ -93,9 +115,9 @@
 //!
 //! ## Open Quality Gates
 //! Quality gates **O-05**, **O-03**, **O-06**, **O-13**, **O-16**, and **D-06** remain **OPEN**:
-//! this crate implements standalone metadata, payload, and directory reader operations. Registry callers, production routing,
-//! range reads, seeking, CAS listing integration, mutations, quarantine integration, and production cutover are not
-//! authorized in this slice.
+//! this crate implements standalone metadata, payload, directory enumeration, and file metadata inspection operations.
+//! Registry callers, production routing, range reads, seeking, CAS listing integration, mutations, quarantine integration,
+//! and production cutover are not authorized in this slice.
 
 pub mod dir;
 pub mod error;
@@ -103,4 +125,4 @@ pub mod reader;
 
 pub use dir::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError, LimitExceededReason};
 pub use error::FsMetadataError;
-pub use reader::FsMetadataReader;
+pub use reader::{FsFileMetadata, FsMetadataReader};
