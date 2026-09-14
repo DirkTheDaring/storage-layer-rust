@@ -388,3 +388,137 @@ async fn run_locked_retains_lock_through_caller_cancellation() {
         "guarded mutation must complete even though the caller was cancelled"
     );
 }
+
+// --------------------------------------------------------------------------
+// Durability barriers (fsync audit)
+// --------------------------------------------------------------------------
+
+// The fault table is process-global; serialize the fault-armed tests so their
+// arm/reset cycles cannot interleave.
+#[cfg(feature = "fault-injection")]
+static FAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// A newly created subdirectory persists its parent entry: ensure_subdir fsyncs
+// the parent exactly when creation happened. With the EnsureSubdirSync fault
+// armed, the creating call reports the sync failure while the directory is
+// already visible (no rollback); the subsequent ensure of the now-existing
+// directory performs no creation, consults no fault, and succeeds.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn ensure_subdir_creation_syncs_parent_and_propagates_failure() {
+    use storage_fs::mutate::fault;
+    let _serial = FAULT_TEST_LOCK.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let r = reader(tmp.path());
+    let root = r.open_contained_dir("").await.unwrap();
+
+    fault::reset();
+    fault::arm(
+        fault::FaultPoint::EnsureSubdirSync,
+        Some("newdir"),
+        1,
+        libc::EIO,
+    );
+    let err = root.ensure_subdir(&name("newdir")).await.unwrap_err();
+    assert!(
+        matches!(err, FsMutateError::Io(_)),
+        "sync failure propagates: {err:?}"
+    );
+    // No rollback: the directory entry is already visible.
+    assert!(
+        tmp.path().join("newdir").is_dir(),
+        "created directory remains visible"
+    );
+
+    // Second ensure: directory exists, no creation, no parent sync, no fault.
+    fault::arm(
+        fault::FaultPoint::EnsureSubdirSync,
+        Some("newdir"),
+        1,
+        libc::EIO,
+    );
+    let sub = root
+        .ensure_subdir(&name("newdir"))
+        .await
+        .expect("existing dir needs no creation sync");
+    // The armed rule was NOT consumed (creation did not occur): a fresh creation elsewhere trips it.
+    let err2 = root.ensure_subdir(&name("newdir2")).await;
+    // needle "newdir" also matches "newdir2"
+    assert!(
+        err2.is_err(),
+        "rule remained armed, proving the existing-dir path consulted no fault"
+    );
+    fault::reset();
+
+    // The surviving authority is usable for durable writes.
+    sub.write_leaf_atomic(&name("leaf"), b"x".to_vec(), true)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("newdir/leaf")).unwrap(), b"x");
+}
+
+// Explicit directory sync failures propagate from BlockingDir/ContainedDir::sync,
+// matched by the authority display path.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn dir_sync_fault_propagates_by_display_path() {
+    use storage_fs::mutate::fault;
+    let _serial = FAULT_TEST_LOCK.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let r = reader(tmp.path());
+    let root = r.open_contained_dir("").await.unwrap();
+    let sub = root.ensure_subdir(&name("synced")).await.unwrap();
+
+    fault::reset();
+    fault::arm(fault::FaultPoint::DirSync, Some("synced"), 1, libc::EIO);
+    let err = sub.sync().await.unwrap_err();
+    assert!(
+        matches!(err, FsMutateError::Io(_)),
+        "dir sync fault propagates: {err:?}"
+    );
+    // A non-matching authority is unaffected.
+    root.sync()
+        .await
+        .expect("root sync unaffected by needle-scoped fault");
+    // Rule consumed: the next sync succeeds.
+    sub.sync()
+        .await
+        .expect("sync succeeds after fault consumed");
+    fault::reset();
+}
+
+// Nested creation chains persist every newly created entry (one parent fsync per
+// created level) and remain contained.
+#[tokio::test]
+async fn ensure_subdir_nested_chain_durable_and_contained() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = reader(tmp.path());
+    let root = r.open_contained_dir("").await.unwrap();
+
+    let a = root.ensure_subdir(&name("a")).await.unwrap();
+    let b = a.ensure_subdir(&name("b")).await.unwrap();
+    let c = b.ensure_subdir(&name("c")).await.unwrap();
+    c.write_leaf_atomic(&name("leaf"), b"deep".to_vec(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("a/b/c/leaf")).unwrap(),
+        b"deep"
+    );
+
+    // A symlinked component still fails closed on the creation path.
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), tmp.path().join("a/link")).unwrap();
+    let err = a.ensure_subdir(&name("link")).await.unwrap_err();
+    assert!(
+        !matches!(err, FsMutateError::NotFound),
+        "symlinked component must fail closed, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.path()).unwrap().count(),
+        0,
+        "no external creation"
+    );
+}

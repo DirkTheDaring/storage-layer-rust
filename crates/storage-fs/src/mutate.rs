@@ -295,6 +295,12 @@ pub mod fault {
         RenameLeaf,
         /// The `unlinkat` inside `BlockingDir::unlink` (staging/hash/meta removal).
         Unlink,
+        /// The parent-directory `fsync` inside `ensure_subdir` after a subdirectory
+        /// was actually created (persistence of the new directory entry).
+        EnsureSubdirSync,
+        /// The directory `fsync` inside `BlockingDir::sync` (explicit caller barrier;
+        /// matched against the authority's display path).
+        DirSync,
     }
 
     struct Rule {
@@ -533,7 +539,9 @@ impl ContainedDir {
     }
 
     /// Create `name` as a subdirectory beneath this directory if absent (idempotent on
-    /// `EEXIST`) and return it as a pinned nested authority.
+    /// `EEXIST`) and return it as a pinned nested authority. When the directory is
+    /// actually created, this directory (the parent) is fsynced before returning so
+    /// the new entry is persisted; an already-existing directory costs no sync.
     pub async fn ensure_subdir(&self, name: &FileName) -> Result<ContainedDir, FsMutateError> {
         #[cfg(target_os = "linux")]
         {
@@ -945,8 +953,15 @@ fn is_regular(mode: libc::mode_t) -> bool {
 /// subsequent `openat2` re-establishes containment (a symlink planted at `name` is
 /// rejected by `RESOLVE_NO_SYMLINKS`).
 #[cfg(target_os = "linux")]
-fn open_subdir_fd(dir_fd: RawFd, name: &FileName, create: bool) -> Result<OwnedFd, FsMutateError> {
+/// Returns the opened directory descriptor plus whether this call actually created
+/// the directory (`create` requested and `mkdirat` succeeded, i.e. not `EEXIST`).
+fn open_subdir_fd(
+    dir_fd: RawFd,
+    name: &FileName,
+    create: bool,
+) -> Result<(OwnedFd, bool), FsMutateError> {
     let c = cstr(name.as_str())?;
+    let mut created = false;
     if create {
         let r = unsafe { libc::mkdirat(dir_fd, c.as_ptr(), 0o755) };
         if r != 0 {
@@ -954,14 +969,17 @@ fn open_subdir_fd(dir_fd: RawFd, name: &FileName, create: bool) -> Result<OwnedF
             if err.raw_os_error() != Some(libc::EEXIST) {
                 return Err(classify_open_err(err));
             }
+        } else {
+            created = true;
         }
     }
-    openat2_beneath(
+    let fd = openat2_beneath(
         dir_fd,
         &c,
         libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
-    )
+    )?;
+    Ok((fd, created))
 }
 
 /// Compose a temporary sibling name. `O_EXCL` is the uniqueness guarantee; pid + a
@@ -1128,14 +1146,31 @@ impl BlockingDir {
 
     /// Open an existing subdirectory beneath this directory as a nested authority.
     pub fn open_subdir(&self, name: &FileName) -> Result<BlockingDir, FsMutateError> {
-        let fd = open_subdir_fd(self.dir_fd.as_raw_fd(), name, false)?;
+        let (fd, _created) = open_subdir_fd(self.dir_fd.as_raw_fd(), name, false)?;
         Ok(self.child(fd, name))
     }
 
     /// Create `name` as a subdirectory if absent (idempotent on `EEXIST`) and return it
     /// as a pinned nested authority.
+    /// Create `name` if absent (idempotent on `EEXIST`) and return it as a pinned
+    /// nested authority. A newly created directory entry is persisted by fsyncing
+    /// this (parent) directory before returning.
     pub fn ensure_subdir(&self, name: &FileName) -> Result<BlockingDir, FsMutateError> {
-        let fd = open_subdir_fd(self.dir_fd.as_raw_fd(), name, true)?;
+        let (fd, created) = open_subdir_fd(self.dir_fd.as_raw_fd(), name, true)?;
+        if created {
+            // Persist the new directory entry in THIS (parent) directory before
+            // handing out the child authority: without it, a durable leaf write
+            // inside the child could survive a crash while the directory entry
+            // chain leading to it does not. Costs nothing when the directory
+            // already existed; errors propagate (the directory is already
+            // visible - an error here is not a rollback).
+            #[cfg(feature = "fault-injection")]
+            crate::mutate::fault::check(
+                crate::mutate::fault::FaultPoint::EnsureSubdirSync,
+                name.as_str(),
+            )?;
+            fsync_pinned_dir(self.dir_fd.as_raw_fd())?;
+        }
         Ok(self.child(fd, name))
     }
 
@@ -1405,6 +1440,11 @@ impl BlockingDir {
 
     /// `fsync` this pinned directory.
     pub fn sync(&self) -> Result<(), FsMutateError> {
+        #[cfg(feature = "fault-injection")]
+        crate::mutate::fault::check(
+            crate::mutate::fault::FaultPoint::DirSync,
+            &self.display_path.to_string_lossy(),
+        )?;
         fsync_pinned_dir(self.dir_fd.as_raw_fd())
     }
 
