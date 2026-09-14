@@ -28,10 +28,19 @@
 
 pub mod error;
 pub mod key;
+pub mod object_store;
 pub mod read;
+
+#[cfg(feature = "contract-tests")]
+pub mod contract;
 
 pub use error::{ObjectKeyError, ReadError};
 pub use key::ObjectKey;
+pub use object_store::{
+    ConditionalDeleteOutcome, CreateOutcome, Durability, ListPage, ListedObject, ListingVersion,
+    ObjectMeta, ObjectRead, ObjectStore, ObjectVersion, PageToken, ReplaceOutcome, StoreError,
+    VersionedRead,
+};
 pub use read::{
     ObjectMetadata, ObjectMetadataReader, ObjectPayload, ObjectPayloadReader, ObjectStream,
 };

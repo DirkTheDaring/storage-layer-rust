@@ -1,0 +1,18 @@
+[package]
+name = "storage-s3"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "S3 object-store adapter for the backend-neutral storage-core contract"
+
+[dependencies]
+async-trait.workspace = true
+aws-sdk-s3.workspace = true
+bytes.workspace = true
+storage-core.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false }
+
+[dev-dependencies]
+storage-core = { workspace = true, features = ["contract-tests"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

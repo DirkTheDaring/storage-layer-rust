@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/storage-core",
     "crates/storage-fs",
+    "crates/storage-s3",
 ]
 
 [workspace.package]
@@ -12,7 +13,10 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+bytes = "1"
 libc = "0.2"
+sha2 = "0.10"
 storage-core = { version = "0.1.0", path = "crates/storage-core" }
 tempfile = "3"
 thiserror = "2"
