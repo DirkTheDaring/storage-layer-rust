@@ -18,6 +18,8 @@
 //! Phase 2 surface.
 
 pub mod client;
+#[cfg(feature = "mock-client")]
+pub mod mock;
 pub mod object_store;
 
 pub use client::{AwsS3Client, S3ApiError, S3Client};

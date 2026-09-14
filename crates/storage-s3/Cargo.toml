@@ -13,6 +13,13 @@ storage-core.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", default-features = false }
 
+[features]
+# Exports the deterministic in-memory `S3Client` mock (`storage_s3::mock`)
+# for tests of this crate and downstream consumers. Never a production
+# feature.
+mock-client = []
+
 [dev-dependencies]
 storage-core = { workspace = true, features = ["contract-tests"] }
+storage-s3 = { path = ".", features = ["mock-client"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

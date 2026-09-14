@@ -1704,6 +1704,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "storage-core",
+ "storage-s3",
  "thiserror",
  "tokio",
 ]

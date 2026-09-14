@@ -1,4 +1,4 @@
-//! Deterministic mock [`S3Client`] for storage-s3 tests.
+//! Deterministic mock [`S3Client`] for tests (feature `mock-client`).
 //!
 //! Models S3 semantics honestly: quoted multipart-style ETags that change
 //! on every write, ATOMIC conditional evaluation (one mutex guards the
@@ -7,7 +7,10 @@
 //! page caps and truncation, byte-bound enforcement while "streaming", and
 //! injectable per-operation failures. It exercises the real adapter logic:
 //! request shapes, classification, pagination, token handling.
-#![allow(dead_code)] // shared across test binaries; not every binary uses every helper
+//!
+//! Exported behind the `mock-client` feature so downstream crates (and this
+//! crate's own integration tests) can drive `S3ObjectStore` deterministically
+//! without an S3 endpoint. Test support only — never a production surface.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -16,7 +19,8 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use storage_s3::client::{
+
+use crate::client::{
     GetResult, ObjectStat, PutPrecondition, RawConditionalDelete, RawListPage, S3ApiError,
     S3Client, too_large_sentinel,
 };
@@ -85,6 +89,20 @@ impl MockS3Client {
             key.to_string(),
             Stored {
                 bytes: Bytes::from_static(bytes),
+                etag,
+                modified: SystemTime::now(),
+            },
+        );
+    }
+
+    /// Owned-bytes variant of [`Self::raw_insert`] for callers seeding
+    /// dynamically composed payloads.
+    pub fn raw_insert_bytes(&self, key: &str, bytes: Vec<u8>) {
+        let etag = self.next_etag();
+        self.objects.lock().unwrap().insert(
+            key.to_string(),
+            Stored {
+                bytes: Bytes::from(bytes),
                 etag,
                 modified: SystemTime::now(),
             },

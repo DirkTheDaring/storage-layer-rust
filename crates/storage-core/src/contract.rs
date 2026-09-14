@@ -292,7 +292,7 @@ pub async fn check_listing(store: &dyn ObjectStore) {
 }
 
 /// 14. Bounded reads: an object larger than the ceiling fails with TooLarge
-/// and nothing is truncated.
+///     and nothing is truncated.
 pub async fn check_read_bound(store: &dyn ObjectStore) {
     let k = key("contract-bounds/large");
     store
@@ -312,7 +312,7 @@ pub async fn check_read_bound(store: &dyn ObjectStore) {
 }
 
 /// 15. Invalid keys are unrepresentable via [`ObjectKey::parse`]; pin the
-/// grammar here so adapters cannot loosen it accidentally.
+///     grammar here so adapters cannot loosen it accidentally.
 pub fn check_invalid_key_rejection() {
     for bad in ["", "/abs", "trail/", "a//b", "a/../b", ".", "a\\b", "C:x"] {
         assert!(

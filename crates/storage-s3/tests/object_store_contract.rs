@@ -5,13 +5,11 @@
 //! contract must be prefix-invariant, proving physical-prefix isolation at
 //! the semantic level).
 
-mod common;
-
 use std::sync::Arc;
 
-use common::MockS3Client;
 use storage_core::contract;
 use storage_s3::S3ObjectStore;
+use storage_s3::mock::MockS3Client;
 
 fn fresh_store(prefix: Option<&str>) -> S3ObjectStore {
     S3ObjectStore::new(Arc::new(MockS3Client::new()), prefix).expect("construct store")

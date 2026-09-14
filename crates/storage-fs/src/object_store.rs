@@ -126,6 +126,15 @@ impl FsObjectStore {
         })
     }
 
+    /// Configuration builder: replace the per-directory enumeration budget
+    /// used by `list_page`. Pure wiring over the existing field — semantics
+    /// are unchanged (exhaustion remains the same truthful error); callers
+    /// that never invoke this keep [`DEFAULT_LIST_ENUMERATION_LIMITS`].
+    pub fn with_enumeration_limits(mut self, limits: DirEnumerationLimits) -> Self {
+        self.enum_limits = limits;
+        self
+    }
+
     /// Split a key into validated intermediate components and the leaf.
     /// Every component of a parsed [`ObjectKey`] is a valid [`FileName`] by
     /// construction; this conversion cannot reject a valid generic key.
