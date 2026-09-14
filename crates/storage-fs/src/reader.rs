@@ -174,6 +174,15 @@ impl FsMetadataReader {
         &self.root_path
     }
 
+    /// Clone the pinned root directory descriptor for descriptor-relative contained
+    /// mutation in [`crate::mutate`]. The returned `Arc` shares the same pinned inode
+    /// authority as this reader, so mutation authorities derived from it stay coherent
+    /// with reads even across pathname replacement of the root.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn root_fd_arc(&self) -> Arc<OwnedFd> {
+        Arc::clone(&self.root_fd)
+    }
+
     /// Probes whether the host kernel and container execution environment permit descriptor-relative `openat2` resolution.
     ///
     /// This is an explicit public backend-specific API on [`FsMetadataReader`] with a private syscall implementation.

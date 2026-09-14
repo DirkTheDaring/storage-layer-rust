@@ -121,8 +121,13 @@
 
 pub mod dir;
 pub mod error;
+pub mod mutate;
 pub mod reader;
 
 pub use dir::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError, LimitExceededReason};
 pub use error::FsMetadataError;
+pub use mutate::{
+    BlockingDir, ContainedDir, ContainedLockGuard, FileName, FsFileIdentity, FsMutateError,
+    LeafWriteMode, OwnedFdHandle,
+};
 pub use reader::{FsFileMetadata, FsMetadataReader};
