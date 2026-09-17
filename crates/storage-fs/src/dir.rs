@@ -162,6 +162,21 @@ impl DirStream {
     pub async fn next_entry(&mut self) -> Option<Result<DirEntry, FsDirError>> {
         self.rx.recv().await
     }
+
+    /// Constructs a `DirStream` from an in-memory sequence of directory entry results
+    /// (useful for test fakes, mocks, and recording enumerators without filesystem I/O).
+    pub fn from_results(results: Vec<Result<DirEntry, FsDirError>>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(results.len().max(1));
+        for r in results {
+            let _ = tx.try_send(r);
+        }
+        Self { rx, _handle: None }
+    }
+
+    /// Constructs a `DirStream` from an in-memory sequence of successful directory entries.
+    pub fn from_entries(entries: Vec<DirEntry>) -> Self {
+        Self::from_results(entries.into_iter().map(Ok).collect())
+    }
 }
 
 /// Caller-specified resource limits for single-directory enumeration.
