@@ -578,26 +578,15 @@ impl ContainedDir {
         after: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<(Vec<String>, bool), FsMutateError> {
-        self.list_page_budgeted(after, limit, None).await
-    }
-
-    /// Enumerate a single page of directory entries strictly after `after` up to `limit`,
-    /// enforcing caller-supplied enumeration limits if provided.
-    pub async fn list_page_budgeted(
-        &self,
-        after: Option<&str>,
-        limit: std::num::NonZeroUsize,
-        limits: Option<DirEnumerationLimits>,
-    ) -> Result<(Vec<String>, bool), FsMutateError> {
         #[cfg(target_os = "linux")]
         {
             let after = after.map(|s| s.to_string());
-            self.offload(move |b| b.list_page_budgeted(after.as_deref(), limit, limits))
+            self.offload(move |b| b.list_page(after.as_deref(), limit))
                 .await
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (after, limit, limits);
+            let _ = (after, limit);
             Err(FsMutateError::PlatformUnsupported)
         }
     }
@@ -1237,23 +1226,11 @@ impl BlockingDir {
         after: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<(Vec<String>, bool), FsMutateError> {
-        self.list_page_budgeted(after, limit, None)
-    }
-
-    /// Enumerate a single page of directory entries strictly after `after` up to `limit`,
-    /// enforcing caller-supplied enumeration limits if provided.
-    pub fn list_page_budgeted(
-        &self,
-        after: Option<&str>,
-        limit: std::num::NonZeroUsize,
-        limits: Option<DirEnumerationLimits>,
-    ) -> Result<(Vec<String>, bool), FsMutateError> {
         crate::dir::enumerate_dir_page_sync(
             &self.dir_fd,
             None,
             after,
             limit,
-            limits,
             #[cfg(test)]
             None,
         )

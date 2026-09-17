@@ -322,7 +322,6 @@ impl FsMetadataReader {
     }
 
     /// Enumerate a single page of directory entries strictly after `after` up to `limit`.
-    /// Enumerate a single page of directory entries strictly after `after` up to `limit`.
     ///
     /// Memory usage is bounded by O(limit) via a streaming min-max heap.
     pub async fn enumerate_dir_page(
@@ -331,19 +330,6 @@ impl FsMetadataReader {
         after: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<(Vec<String>, bool), crate::dir::FsDirError> {
-        self.enumerate_dir_page_budgeted(target, after, limit, None)
-            .await
-    }
-
-    /// Enumerate a single page of directory entries strictly after `after` up to `limit`,
-    /// enforcing caller-supplied enumeration limits if provided.
-    pub async fn enumerate_dir_page_budgeted(
-        &self,
-        target: Option<&ObjectKey>,
-        after: Option<&str>,
-        limit: std::num::NonZeroUsize,
-        limits: Option<crate::dir::DirEnumerationLimits>,
-    ) -> Result<(Vec<String>, bool), crate::dir::FsDirError> {
         #[cfg(target_os = "linux")]
         {
             crate::dir::enumerate_dir_page_async(
@@ -351,7 +337,6 @@ impl FsMetadataReader {
                 target,
                 after,
                 limit,
-                limits,
                 #[cfg(test)]
                 self.dir_test_hooks.as_ref(),
             )
@@ -360,7 +345,7 @@ impl FsMetadataReader {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (target, after, limit, limits);
+            let _ = (target, after, limit);
             Err(crate::dir::FsDirError::PlatformUnsupported)
         }
     }

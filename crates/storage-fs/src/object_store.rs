@@ -80,14 +80,8 @@ use storage_core::object_store::{
 };
 use storage_core::{ObjectKey, ObjectKeyError};
 
-use crate::dir::DirEnumerationLimits;
 use crate::mutate::{BlockingDir, ContainedDir, FileName, FsMutateError};
 use crate::reader::FsMetadataReader;
-
-/// Default per-directory enumeration budget for `list_page` (entries,
-/// cumulative name bytes). Retained for backwards compatibility.
-#[deprecated(note = "enumeration limits are removed; list_page uses bounded streaming")]
-pub const DEFAULT_LIST_ENUMERATION_LIMITS: (usize, usize) = (100_000, 10_000_000);
 
 /// Internal bookkeeping directory name. Contains `U+0001`, which the
 /// backend-neutral `ObjectKey` grammar rejects (control character), making
@@ -105,7 +99,6 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub struct FsObjectStore {
     root: ContainedDir,
-    enum_limits: Option<DirEnumerationLimits>,
 }
 
 impl FsObjectStore {
@@ -117,17 +110,7 @@ impl FsObjectStore {
         let root = reader
             .open_contained_dir_sync("")
             .map_err(map_fs_mutate_err)?;
-        Ok(Self {
-            root,
-            enum_limits: None,
-        })
-    }
-
-    /// Configuration builder: sets optional single-directory enumeration limits.
-    /// By default, enumeration is unbounded streaming (O(limit) space).
-    pub fn with_enumeration_limits(mut self, limits: DirEnumerationLimits) -> Self {
-        self.enum_limits = Some(limits);
-        self
+        Ok(Self { root })
     }
 
     /// Split a key into validated intermediate components and the leaf.
@@ -651,10 +634,7 @@ impl ObjectStore for FsObjectStore {
         // Bounded to prevent infinite loops under adversarial concurrent churn.
         for _ in 0..1024 {
             let needed = NonZeroUsize::new(limit.get().saturating_sub(rows.len())).unwrap_or(limit);
-            let (leaves, batch_more) = match dir
-                .list_page_budgeted(current_after.as_deref(), needed, self.enum_limits)
-                .await
-            {
+            let (leaves, batch_more) = match dir.list_page(current_after.as_deref(), needed).await {
                 Ok(res) => res,
                 Err(FsMutateError::NotFound) => {
                     return Ok(ListPage {

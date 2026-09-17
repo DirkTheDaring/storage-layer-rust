@@ -701,7 +701,6 @@ pub(crate) async fn enumerate_dir_page_async(
     target: Option<&ObjectKey>,
     after: Option<&str>,
     limit: std::num::NonZeroUsize,
-    limits: Option<DirEnumerationLimits>,
     #[cfg(test)] hooks: Option<&DirTestHooks>,
 ) -> Result<(Vec<String>, bool), FsDirError> {
     let handle = match tokio::runtime::Handle::try_current() {
@@ -722,7 +721,6 @@ pub(crate) async fn enumerate_dir_page_async(
                 target.as_ref(),
                 after.as_deref(),
                 limit,
-                limits,
                 #[cfg(test)]
                 hooks.as_ref(),
             )
@@ -741,7 +739,6 @@ pub(crate) async fn enumerate_dir_page_async(
     _target: Option<&ObjectKey>,
     _after: Option<&str>,
     _limit: std::num::NonZeroUsize,
-    _limits: Option<DirEnumerationLimits>,
     _hooks: Option<&DirTestHooks>,
 ) -> Result<(Vec<String>, bool), FsDirError> {
     Err(FsDirError::PlatformUnsupported)
@@ -755,7 +752,6 @@ pub(crate) fn enumerate_dir_page_sync(
     target: Option<&ObjectKey>,
     after: Option<&str>,
     limit: std::num::NonZeroUsize,
-    limits: Option<DirEnumerationLimits>,
     #[cfg(test)] hooks: Option<&DirTestHooks>,
 ) -> Result<(Vec<String>, bool), FsDirError> {
     #[cfg(test)]
@@ -862,8 +858,6 @@ pub(crate) fn enumerate_dir_page_sync(
 
     let capacity = limit.get().saturating_add(1);
     let mut heap = BoundedLexicalHeap::new(capacity);
-    let mut total_entries: usize = 0;
-    let mut total_name_bytes: usize = 0;
 
     loop {
         #[cfg(test)]
@@ -892,12 +886,6 @@ pub(crate) fn enumerate_dir_page_sync(
 
         if name_bytes == b"." || name_bytes == b".." {
             continue;
-        }
-
-        if let Some(ref lim) = limits {
-            total_name_bytes =
-                account_entry(total_entries, total_name_bytes, name_bytes.len(), lim)?;
-            total_entries += 1;
         }
 
         let Ok(name_str) = std::str::from_utf8(name_bytes) else {
