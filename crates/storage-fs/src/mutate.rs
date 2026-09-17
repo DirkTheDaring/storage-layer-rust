@@ -570,6 +570,50 @@ impl ContainedDir {
         }
     }
 
+    /// Enumerate a single page of directory entries strictly after `after` up to `limit`.
+    ///
+    /// Memory usage is bounded by O(limit) via a streaming min-max heap.
+    pub async fn list_page(
+        &self,
+        after: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<(Vec<String>, bool), FsMutateError> {
+        self.list_page_budgeted(after, limit, None).await
+    }
+
+    /// Enumerate a single page of directory entries strictly after `after` up to `limit`,
+    /// enforcing caller-supplied enumeration limits if provided.
+    pub async fn list_page_budgeted(
+        &self,
+        after: Option<&str>,
+        limit: std::num::NonZeroUsize,
+        limits: Option<DirEnumerationLimits>,
+    ) -> Result<(Vec<String>, bool), FsMutateError> {
+        #[cfg(target_os = "linux")]
+        {
+            let after = after.map(|s| s.to_string());
+            self.offload(move |b| b.list_page_budgeted(after.as_deref(), limit, limits))
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (after, limit, limits);
+            Err(FsMutateError::PlatformUnsupported)
+        }
+    }
+
+    /// Asynchronously streams directory entries with backpressure.
+    pub fn stream(&self) -> Result<crate::dir::DirStream, FsMutateError> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::dir::stream_dir_async(&self.dir_fd, None).map_err(map_dir_err)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(FsMutateError::PlatformUnsupported)
+        }
+    }
+
     /// Inspect a leaf's identity. `Ok(None)` means the leaf is absent (`ENOENT`);
     /// other resolution failures are typed errors.
     pub async fn inspect(&self, name: &FileName) -> Result<Option<FsFileIdentity>, FsMutateError> {
@@ -1180,6 +1224,35 @@ impl BlockingDir {
         crate::dir::enumerate_dir_sync(
             &self.dir_fd,
             None,
+            limits,
+            #[cfg(test)]
+            None,
+        )
+        .map_err(map_dir_err)
+    }
+
+    /// Enumerate a single page of directory entries strictly after `after` up to `limit`.
+    pub fn list_page(
+        &self,
+        after: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<(Vec<String>, bool), FsMutateError> {
+        self.list_page_budgeted(after, limit, None)
+    }
+
+    /// Enumerate a single page of directory entries strictly after `after` up to `limit`,
+    /// enforcing caller-supplied enumeration limits if provided.
+    pub fn list_page_budgeted(
+        &self,
+        after: Option<&str>,
+        limit: std::num::NonZeroUsize,
+        limits: Option<DirEnumerationLimits>,
+    ) -> Result<(Vec<String>, bool), FsMutateError> {
+        crate::dir::enumerate_dir_page_sync(
+            &self.dir_fd,
+            None,
+            after,
+            limit,
             limits,
             #[cfg(test)]
             None,

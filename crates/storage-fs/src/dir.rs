@@ -54,6 +54,7 @@
 //!   provide mount isolation for child mounts attached beneath the root.
 //! - **Cancellation**: Dropping the awaiting future does not cancel in-flight blocking kernel I/O.
 
+use std::collections::BinaryHeap;
 use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -62,6 +63,106 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use storage_core::ObjectKey;
+
+/// Backend-neutral leaf filter: an entry is a candidate generic object iff its name
+/// is a valid single-component generic key.
+pub(crate) fn is_generic_leaf_name(name: &str) -> bool {
+    !name.contains('/') && ObjectKey::parse(name).is_ok()
+}
+
+/// Bounded max-heap for streaming lexicographical Top-K selection.
+/// Retains at most `capacity` entries.
+#[derive(Debug)]
+pub(crate) struct BoundedLexicalHeap {
+    heap: BinaryHeap<String>,
+    capacity: usize,
+}
+
+impl BoundedLexicalHeap {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity.min(1024)),
+            capacity,
+        }
+    }
+
+    /// Considers `candidate` for inclusion.
+    /// If `after` is given, candidates strictly less than or equal to `after` are skipped with zero allocation.
+    #[allow(dead_code)]
+    pub(crate) fn push_if_after(&mut self, candidate: String, after: Option<&str>) {
+        if let Some(a) = after
+            && candidate.as_str() <= a
+        {
+            return;
+        }
+        if self.capacity == 0 {
+            return;
+        }
+        if self.heap.len() < self.capacity {
+            self.heap.push(candidate);
+        } else if let Some(max_elem) = self.heap.peek()
+            && candidate.as_str() < max_elem.as_str()
+        {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.heap.len() >= self.capacity
+    }
+
+    pub(crate) fn peek(&self) -> Option<&String> {
+        self.heap.peek()
+    }
+
+    pub(crate) fn push(&mut self, candidate: String) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.heap.len() < self.capacity {
+            self.heap.push(candidate);
+        } else if let Some(max_elem) = self.heap.peek()
+            && candidate.as_str() < max_elem.as_str()
+        {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    /// Consumes the heap and returns the retained entries in ascending sorted order.
+    pub(crate) fn into_sorted_vec(self) -> Vec<String> {
+        self.heap.into_sorted_vec()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.heap.len()
+    }
+}
+
+/// Asynchronous stream yielding directory entries with backpressure.
+pub struct DirStream {
+    rx: tokio::sync::mpsc::Receiver<Result<DirEntry, FsDirError>>,
+    _handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DirStream {
+    pub(crate) fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<DirEntry, FsDirError>>,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx,
+            _handle: handle,
+        }
+    }
+
+    /// Yields the next directory entry, or `None` when enumeration completes.
+    pub async fn next_entry(&mut self) -> Option<Result<DirEntry, FsDirError>> {
+        self.rx.recv().await
+    }
+}
 
 /// Caller-specified resource limits for single-directory enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,6 +693,528 @@ pub(crate) fn enumerate_dir_sync(
     Ok(entries)
 }
 
+/// Asynchronously enumerates a directory and collects up to `limit` lexicographically smallest
+/// regular file names strictly after `after`.
+#[cfg(target_os = "linux")]
+pub(crate) async fn enumerate_dir_page_async(
+    root_fd: &Arc<OwnedFd>,
+    target: Option<&ObjectKey>,
+    after: Option<&str>,
+    limit: std::num::NonZeroUsize,
+    limits: Option<DirEnumerationLimits>,
+    #[cfg(test)] hooks: Option<&DirTestHooks>,
+) -> Result<(Vec<String>, bool), FsDirError> {
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(e) => return Err(FsDirError::RuntimeMissing(e)),
+    };
+
+    let root_fd = Arc::clone(root_fd);
+    let target = target.cloned();
+    let after = after.map(|s| s.to_string());
+    #[cfg(test)]
+    let hooks = hooks.cloned();
+
+    let join_res = handle
+        .spawn_blocking(move || {
+            enumerate_dir_page_sync(
+                &root_fd,
+                target.as_ref(),
+                after.as_deref(),
+                limit,
+                limits,
+                #[cfg(test)]
+                hooks.as_ref(),
+            )
+        })
+        .await;
+
+    match join_res {
+        Ok(res) => res,
+        Err(join_err) => Err(FsDirError::TaskJoinFailed(join_err)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn enumerate_dir_page_async(
+    _root_fd: &Arc<OwnedFd>,
+    _target: Option<&ObjectKey>,
+    _after: Option<&str>,
+    _limit: std::num::NonZeroUsize,
+    _limits: Option<DirEnumerationLimits>,
+    _hooks: Option<&DirTestHooks>,
+) -> Result<(Vec<String>, bool), FsDirError> {
+    Err(FsDirError::PlatformUnsupported)
+}
+
+/// Synchronously enumerates a directory and collects up to `limit + 1` lexicographically smallest
+/// regular file names strictly after `after`.
+#[cfg(target_os = "linux")]
+pub(crate) fn enumerate_dir_page_sync(
+    root_fd: &OwnedFd,
+    target: Option<&ObjectKey>,
+    after: Option<&str>,
+    limit: std::num::NonZeroUsize,
+    limits: Option<DirEnumerationLimits>,
+    #[cfg(test)] hooks: Option<&DirTestHooks>,
+) -> Result<(Vec<String>, bool), FsDirError> {
+    #[cfg(test)]
+    if let Some(hook) = hooks.and_then(|h| h.before_open.as_ref()) {
+        hook();
+    }
+
+    let target_str = target.map(|k| k.to_string());
+
+    let c_target = match target {
+        None => std::ffi::CString::new(".").expect("dot is valid CString"),
+        Some(key) => std::ffi::CString::new(key.as_str()).map_err(|_| FsDirError::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "key contains embedded NUL byte",
+            ),
+        })?,
+    };
+
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.mode = 0;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            c_target.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+
+    if res < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(match err.raw_os_error() {
+            Some(libc::ENOSYS) => FsDirError::SyscallUnsupported(err),
+            Some(libc::ENOENT) => FsDirError::NotFound { path: target_str },
+            Some(libc::ENOTDIR) => FsDirError::NotADirectory { path: target_str },
+            Some(libc::EACCES) | Some(libc::EPERM) => FsDirError::PermissionDenied {
+                path: target_str,
+                source: err,
+            },
+            Some(libc::ELOOP) | Some(libc::EXDEV) => FsDirError::ResolutionRejected {
+                raw_os_error: err.raw_os_error().unwrap_or(0),
+                source: err,
+            },
+            _ => FsDirError::Io { source: err },
+        });
+    }
+
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(res as i32) };
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.and_then(|h| h.after_openat2.as_ref()) {
+        hook(&owned_fd);
+    }
+
+    let raw_fd = owned_fd.as_raw_fd();
+
+    #[cfg(test)]
+    let (dir_ptr, acq_err) = match hooks.and_then(|h| h.simulate_fdopendir_error.as_ref()) {
+        Some(inject_fn) => (std::ptr::null_mut(), Some(inject_fn())),
+        None => {
+            let ptr = unsafe { libc::fdopendir(raw_fd) };
+            let err = if ptr.is_null() {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            (ptr, err)
+        }
+    };
+
+    #[cfg(not(test))]
+    let (dir_ptr, acq_err) = {
+        let ptr = unsafe { libc::fdopendir(raw_fd) };
+        let err = if ptr.is_null() {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        (ptr, err)
+    };
+
+    if dir_ptr.is_null() {
+        drop(owned_fd);
+        #[cfg(test)]
+        if let Some(hook) = hooks.and_then(|h| h.on_fd_closed.as_ref()) {
+            hook(raw_fd);
+        }
+        let source = acq_err.unwrap_or_else(|| std::io::Error::other("fdopendir returned null"));
+        return Err(FsDirError::Io { source });
+    }
+
+    let _ = owned_fd.into_raw_fd();
+    let dir_guard = DirGuard {
+        dir: dir_ptr,
+        #[cfg(test)]
+        on_drop: hooks.and_then(|h| h.on_dir_closed.clone()),
+    };
+    let dir_fd = unsafe { libc::dirfd(dir_guard.dir) };
+
+    let capacity = limit.get().saturating_add(1);
+    let mut heap = BoundedLexicalHeap::new(capacity);
+    let mut total_entries: usize = 0;
+    let mut total_name_bytes: usize = 0;
+
+    loop {
+        #[cfg(test)]
+        if let Some(hook) = hooks.and_then(|h| h.before_readdir.as_ref()) {
+            hook();
+        }
+
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+
+        let entry_ptr = unsafe { libc::readdir(dir_guard.dir) };
+        if entry_ptr.is_null() {
+            let raw_errno = unsafe { *libc::__errno_location() };
+            if raw_errno == 0 {
+                break;
+            } else {
+                let err = std::io::Error::from_raw_os_error(raw_errno);
+                return Err(FsDirError::Io { source: err });
+            }
+        }
+
+        let d_entry = unsafe { &*entry_ptr };
+        let c_name = unsafe { std::ffi::CStr::from_ptr(d_entry.d_name.as_ptr()) };
+        let name_bytes = c_name.to_bytes();
+
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        if let Some(ref lim) = limits {
+            total_name_bytes =
+                account_entry(total_entries, total_name_bytes, name_bytes.len(), lim)?;
+            total_entries += 1;
+        }
+
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+
+        if !is_generic_leaf_name(name_str) {
+            continue;
+        }
+
+        if let Some(a) = after
+            && name_str <= a
+        {
+            continue;
+        }
+
+        // Pruning: if the heap is already full and this candidate is >= the current maximum,
+        // it can never enter the top-K. Skipping immediately avoids fallback fstatat and String allocation.
+        if heap.is_full()
+            && let Some(max_elem) = heap.peek()
+            && name_str >= max_elem.as_str()
+        {
+            continue;
+        }
+
+        #[cfg(test)]
+        let d_type = if let Some(sim) = hooks.and_then(|h| h.simulate_dt_unknown.as_ref()) {
+            let os_name = OsStr::from_bytes(name_bytes);
+            if sim(os_name) {
+                libc::DT_UNKNOWN
+            } else {
+                d_entry.d_type
+            }
+        } else {
+            d_entry.d_type
+        };
+
+        #[cfg(not(test))]
+        let d_type = d_entry.d_type;
+
+        let is_reg = if d_type == libc::DT_REG {
+            true
+        } else if d_type == libc::DT_UNKNOWN {
+            #[cfg(test)]
+            if let Some(hook) = hooks.and_then(|h| h.before_stat_fallback.as_ref()) {
+                hook(OsStr::from_bytes(name_bytes));
+            }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let stat_res = unsafe {
+                libc::fstatat(dir_fd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            if stat_res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                }
+                return Err(FsDirError::Io { source: err });
+            }
+            (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+        } else {
+            false
+        };
+
+        if !is_reg {
+            continue;
+        }
+
+        heap.push(name_str.to_string());
+    }
+
+    let mut leaves = heap.into_sorted_vec();
+    let more = leaves.len() > limit.get();
+    if more {
+        leaves.truncate(limit.get());
+    }
+
+    Ok((leaves, more))
+}
+
+/// Asynchronously streams directory entries with backpressure using an internal bounded channel.
+#[cfg(target_os = "linux")]
+pub fn stream_dir_async(
+    root_fd: &Arc<OwnedFd>,
+    target: Option<&ObjectKey>,
+) -> Result<DirStream, FsDirError> {
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(e) => return Err(FsDirError::RuntimeMissing(e)),
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let root_fd = Arc::clone(root_fd);
+    let target = target.cloned();
+
+    let task = handle.spawn_blocking(move || {
+        stream_dir_sync(
+            &root_fd,
+            target.as_ref(),
+            tx,
+            #[cfg(test)]
+            None,
+        );
+    });
+
+    Ok(DirStream::new(rx, Some(task)))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn stream_dir_async(
+    _root_fd: &Arc<OwnedFd>,
+    _target: Option<&ObjectKey>,
+) -> Result<DirStream, FsDirError> {
+    Err(FsDirError::PlatformUnsupported)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn stream_dir_sync(
+    root_fd: &OwnedFd,
+    target: Option<&ObjectKey>,
+    tx: tokio::sync::mpsc::Sender<Result<DirEntry, FsDirError>>,
+    #[cfg(test)] hooks: Option<&DirTestHooks>,
+) {
+    #[cfg(test)]
+    if let Some(hook) = hooks.and_then(|h| h.before_open.as_ref()) {
+        hook();
+    }
+
+    let target_str = target.map(|k| k.to_string());
+
+    let c_target = match target {
+        None => std::ffi::CString::new(".").expect("dot is valid CString"),
+        Some(key) => match std::ffi::CString::new(key.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = tx.blocking_send(Err(FsDirError::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "key contains embedded NUL byte",
+                    ),
+                }));
+                return;
+            }
+        },
+    };
+
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.mode = 0;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            c_target.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+
+    if res < 0 {
+        let err = std::io::Error::last_os_error();
+        let mapped = match err.raw_os_error() {
+            Some(libc::ENOSYS) => FsDirError::SyscallUnsupported(err),
+            Some(libc::ENOENT) => FsDirError::NotFound { path: target_str },
+            Some(libc::ENOTDIR) => FsDirError::NotADirectory { path: target_str },
+            Some(libc::EACCES) | Some(libc::EPERM) => FsDirError::PermissionDenied {
+                path: target_str,
+                source: err,
+            },
+            Some(libc::ELOOP) | Some(libc::EXDEV) => FsDirError::ResolutionRejected {
+                raw_os_error: err.raw_os_error().unwrap_or(0),
+                source: err,
+            },
+            _ => FsDirError::Io { source: err },
+        };
+        let _ = tx.blocking_send(Err(mapped));
+        return;
+    }
+
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(res as i32) };
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.and_then(|h| h.after_openat2.as_ref()) {
+        hook(&owned_fd);
+    }
+
+    let raw_fd = owned_fd.as_raw_fd();
+
+    #[cfg(test)]
+    let (dir_ptr, acq_err) = match hooks.and_then(|h| h.simulate_fdopendir_error.as_ref()) {
+        Some(inject_fn) => (std::ptr::null_mut(), Some(inject_fn())),
+        None => {
+            let ptr = unsafe { libc::fdopendir(raw_fd) };
+            let err = if ptr.is_null() {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            (ptr, err)
+        }
+    };
+
+    #[cfg(not(test))]
+    let (dir_ptr, acq_err) = {
+        let ptr = unsafe { libc::fdopendir(raw_fd) };
+        let err = if ptr.is_null() {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        (ptr, err)
+    };
+
+    if dir_ptr.is_null() {
+        drop(owned_fd);
+        #[cfg(test)]
+        if let Some(hook) = hooks.and_then(|h| h.on_fd_closed.as_ref()) {
+            hook(raw_fd);
+        }
+        let source = acq_err.unwrap_or_else(|| std::io::Error::other("fdopendir returned null"));
+        let _ = tx.blocking_send(Err(FsDirError::Io { source }));
+        return;
+    }
+
+    let _ = owned_fd.into_raw_fd();
+    let dir_guard = DirGuard {
+        dir: dir_ptr,
+        #[cfg(test)]
+        on_drop: hooks.and_then(|h| h.on_dir_closed.clone()),
+    };
+    let dir_fd = unsafe { libc::dirfd(dir_guard.dir) };
+
+    loop {
+        #[cfg(test)]
+        if let Some(hook) = hooks.and_then(|h| h.before_readdir.as_ref()) {
+            hook();
+        }
+
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+
+        let entry_ptr = unsafe { libc::readdir(dir_guard.dir) };
+        if entry_ptr.is_null() {
+            let raw_errno = unsafe { *libc::__errno_location() };
+            if raw_errno == 0 {
+                break;
+            } else {
+                let err = std::io::Error::from_raw_os_error(raw_errno);
+                let _ = tx.blocking_send(Err(FsDirError::Io { source: err }));
+                return;
+            }
+        }
+
+        let d_entry = unsafe { &*entry_ptr };
+        let c_name = unsafe { std::ffi::CStr::from_ptr(d_entry.d_name.as_ptr()) };
+        let name_bytes = c_name.to_bytes();
+
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let name = OsStr::from_bytes(name_bytes).to_os_string();
+
+        #[cfg(test)]
+        let d_type = if let Some(sim) = hooks.and_then(|h| h.simulate_dt_unknown.as_ref()) {
+            if sim(&name) {
+                libc::DT_UNKNOWN
+            } else {
+                d_entry.d_type
+            }
+        } else {
+            d_entry.d_type
+        };
+
+        #[cfg(not(test))]
+        let d_type = d_entry.d_type;
+
+        let file_type = match d_type {
+            libc::DT_REG => DirEntryType::Regular,
+            libc::DT_DIR => DirEntryType::Directory,
+            libc::DT_LNK => DirEntryType::Symlink,
+            libc::DT_UNKNOWN => {
+                #[cfg(test)]
+                if let Some(hook) = hooks.and_then(|h| h.before_stat_fallback.as_ref()) {
+                    hook(&name);
+                }
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let stat_res = unsafe {
+                    libc::fstatat(dir_fd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                };
+                if stat_res != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ENOENT) {
+                        continue;
+                    }
+                    let _ = tx.blocking_send(Err(FsDirError::Io { source: err }));
+                    return;
+                }
+                match st.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => DirEntryType::Regular,
+                    libc::S_IFDIR => DirEntryType::Directory,
+                    libc::S_IFLNK => DirEntryType::Symlink,
+                    _ => DirEntryType::Other,
+                }
+            }
+            _ => DirEntryType::Other,
+        };
+
+        let entry = DirEntry::new(name, file_type);
+        if tx.blocking_send(Ok(entry)).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +1226,29 @@ mod tests {
         let limits = DirEnumerationLimits::new(42, 1024);
         assert_eq!(limits.max_entries(), 42);
         assert_eq!(limits.max_total_name_bytes(), 1024);
+    }
+
+    #[test]
+    fn test_bounded_lexical_heap() {
+        let mut heap = BoundedLexicalHeap::new(3);
+        for item in ["echo", "bravo", "delta", "alpha", "charlie"] {
+            heap.push_if_after(item.to_string(), None);
+        }
+        let sorted = heap.into_sorted_vec();
+        assert_eq!(sorted, vec!["alpha", "bravo", "charlie"]);
+
+        let mut heap_after = BoundedLexicalHeap::new(3);
+        for item in ["echo", "bravo", "delta", "alpha", "charlie"] {
+            heap_after.push_if_after(item.to_string(), Some("bravo"));
+        }
+        let sorted_after = heap_after.into_sorted_vec();
+        assert_eq!(sorted_after, vec!["charlie", "delta", "echo"]);
+
+        let mut heap_overflow = BoundedLexicalHeap::new(2);
+        for item in ["z", "y", "x", "w", "v"] {
+            heap_overflow.push_if_after(item.to_string(), None);
+        }
+        assert_eq!(heap_overflow.into_sorted_vec(), vec!["v", "w"]);
     }
 
     #[test]
@@ -1477,6 +2123,77 @@ mod tests {
                 0,
                 "libc::closedir must return 0 indicating clean descriptor closure on early abort"
             );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_stream_dir_async_and_cancellation() {
+            let fixture = TempDir::new().unwrap();
+            let root = fixture.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+
+            for i in 0..10 {
+                fs::write(root.join(format!("file_{i:02}")), b"content").unwrap();
+            }
+
+            let reader = FsMetadataReader::open(&root).unwrap();
+            let mut stream = reader.stream_dir(None).unwrap();
+
+            let mut count = 0;
+            while let Some(res) = stream.next_entry().await {
+                let entry = res.unwrap();
+                assert_eq!(entry.file_type(), DirEntryType::Regular);
+                count += 1;
+                if count == 3 {
+                    // Early drop / cancellation
+                    break;
+                }
+            }
+            drop(stream);
+
+            // Re-stream all
+            let mut stream_all = reader.stream_dir(None).unwrap();
+            let mut all_count = 0;
+            while let Some(res) = stream_all.next_entry().await {
+                let _ = res.unwrap();
+                all_count += 1;
+            }
+            assert_eq!(all_count, 10);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_enumerate_dir_page_async() {
+            use std::num::NonZeroUsize;
+            let fixture = TempDir::new().unwrap();
+            let root = fixture.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+
+            for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+                fs::write(root.join(name), b"test").unwrap();
+            }
+
+            let reader = FsMetadataReader::open(&root).unwrap();
+            let limit = NonZeroUsize::new(2).unwrap();
+
+            // Page 1
+            let (p1, more1) = reader.enumerate_dir_page(None, None, limit).await.unwrap();
+            assert_eq!(p1, vec!["alpha", "bravo"]);
+            assert!(more1);
+
+            // Page 2
+            let (p2, more2) = reader
+                .enumerate_dir_page(None, p1.last().map(|s| s.as_str()), limit)
+                .await
+                .unwrap();
+            assert_eq!(p2, vec!["charlie", "delta"]);
+            assert!(more2);
+
+            // Page 3
+            let (p3, more3) = reader
+                .enumerate_dir_page(None, p2.last().map(|s| s.as_str()), limit)
+                .await
+                .unwrap();
+            assert_eq!(p3, vec!["echo"]);
+            assert!(!more3);
         }
 
         fn futures_util_waker() -> std::task::Waker {

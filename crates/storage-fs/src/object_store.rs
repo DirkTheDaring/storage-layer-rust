@@ -80,13 +80,13 @@ use storage_core::object_store::{
 };
 use storage_core::{ObjectKey, ObjectKeyError};
 
-use crate::dir::{DirEntryType, DirEnumerationLimits};
+use crate::dir::DirEnumerationLimits;
 use crate::mutate::{BlockingDir, ContainedDir, FileName, FsMutateError};
 use crate::reader::FsMetadataReader;
 
 /// Default per-directory enumeration budget for `list_page` (entries,
-/// cumulative name bytes). Deliberately generous; exhaustion is a truthful
-/// error, never truncation.
+/// cumulative name bytes). Retained for backwards compatibility.
+#[deprecated(note = "enumeration limits are removed; list_page uses bounded streaming")]
 pub const DEFAULT_LIST_ENUMERATION_LIMITS: (usize, usize) = (100_000, 10_000_000);
 
 /// Internal bookkeeping directory name. Contains `U+0001`, which the
@@ -105,7 +105,7 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub struct FsObjectStore {
     root: ContainedDir,
-    enum_limits: DirEnumerationLimits,
+    enum_limits: Option<DirEnumerationLimits>,
 }
 
 impl FsObjectStore {
@@ -119,19 +119,14 @@ impl FsObjectStore {
             .map_err(map_fs_mutate_err)?;
         Ok(Self {
             root,
-            enum_limits: DirEnumerationLimits::new(
-                DEFAULT_LIST_ENUMERATION_LIMITS.0,
-                DEFAULT_LIST_ENUMERATION_LIMITS.1,
-            ),
+            enum_limits: None,
         })
     }
 
-    /// Configuration builder: replace the per-directory enumeration budget
-    /// used by `list_page`. Pure wiring over the existing field — semantics
-    /// are unchanged (exhaustion remains the same truthful error); callers
-    /// that never invoke this keep [`DEFAULT_LIST_ENUMERATION_LIMITS`].
+    /// Configuration builder: sets optional single-directory enumeration limits.
+    /// By default, enumeration is unbounded streaming (O(limit) space).
     pub fn with_enumeration_limits(mut self, limits: DirEnumerationLimits) -> Self {
-        self.enum_limits = limits;
+        self.enum_limits = Some(limits);
         self
     }
 
@@ -381,14 +376,6 @@ fn map_fs_mutate_err(e: FsMutateError) -> StoreError {
 
 fn map_key_err(e: ObjectKeyError) -> StoreError {
     StoreError::invalid_input(format!("invalid object key: {e}"))
-}
-
-/// Backend-neutral leaf filter for listings: an entry is a candidate
-/// generic object iff its name is a valid single-component generic key.
-/// Adapter bookkeeping names contain a control character and are excluded
-/// HERE by the generic grammar itself, not by any filename convention.
-fn is_generic_leaf_name(name: &str) -> bool {
-    !name.contains('/') && ObjectKey::parse(name).is_ok()
 }
 
 /// Synchronous observation of the current generation inside a `run_locked`
@@ -656,69 +643,67 @@ impl ObjectStore for FsObjectStore {
             });
         };
 
-        let entries = match dir.list(self.enum_limits).await {
-            Ok(e) => e,
-            Err(FsMutateError::NotFound) => {
-                return Ok(ListPage {
-                    objects: Vec::new(),
-                    next: None,
-                });
-            }
-            Err(e) => return Err(map_fs_mutate_err(e)),
-        };
-
-        // Structural filtering only: regular files whose names are valid
-        // generic key components (the backend-neutral grammar). Whether an
-        // object is a VALID domain object is decided above this boundary.
-        let mut leaves: Vec<String> = Vec::new();
-        for entry in entries {
-            if entry.file_type() != DirEntryType::Regular {
-                continue;
-            }
-            let Some(name) = entry.name().to_str() else {
-                continue;
-            };
-            if !is_generic_leaf_name(name) {
-                continue;
-            }
-            leaves.push(name.to_string());
-        }
-        leaves.sort_unstable();
-        leaves.dedup();
-
-        let after_leaf = after.map(adapter::page_token_value);
+        let mut current_after = after.map(|t| adapter::page_token_value(t).to_string());
         let mut rows: Vec<ListedObject> = Vec::new();
         let mut more = false;
-        for leaf_name in leaves {
-            if let Some(a) = after_leaf
-                && leaf_name.as_str() <= a
+
+        // Loop to fill up to `limit` objects, stepping across vanished leaves.
+        // Bounded to prevent infinite loops under adversarial concurrent churn.
+        for _ in 0..1024 {
+            let needed = NonZeroUsize::new(limit.get().saturating_sub(rows.len())).unwrap_or(limit);
+            let (leaves, batch_more) = match dir
+                .list_page_budgeted(current_after.as_deref(), needed, self.enum_limits)
+                .await
             {
-                continue;
-            }
-            if rows.len() == limit.get() {
-                more = true;
+                Ok(res) => res,
+                Err(FsMutateError::NotFound) => {
+                    return Ok(ListPage {
+                        objects: Vec::new(),
+                        next: None,
+                    });
+                }
+                Err(e) => return Err(map_fs_mutate_err(e)),
+            };
+
+            if leaves.is_empty() {
+                more = false;
                 break;
             }
-            let leaf = FileName::new(&leaf_name).map_err(map_fs_mutate_err)?;
-            // A row observed by enumeration may vanish before the per-row
-            // stat: benign absence, the row is skipped.
-            let Some(meta) = Self::stat_leaf(&dir, &leaf).await? else {
-                continue;
-            };
-            let key = match prefix {
-                Some(p) => {
-                    ObjectKey::parse(&format!("{}/{leaf_name}", p.as_str())).map_err(map_key_err)?
+
+            let last_leaf_in_batch = leaves.last().cloned();
+
+            for leaf_name in leaves {
+                let leaf = FileName::new(&leaf_name).map_err(map_fs_mutate_err)?;
+                // A row observed by enumeration may vanish before the per-row
+                // stat: benign absence, the row is skipped.
+                let Some(meta) = Self::stat_leaf(&dir, &leaf).await? else {
+                    continue;
+                };
+                let key = match prefix {
+                    Some(p) => ObjectKey::parse(&format!("{}/{leaf_name}", p.as_str()))
+                        .map_err(map_key_err)?,
+                    None => ObjectKey::parse(&leaf_name).map_err(map_key_err)?,
+                };
+                rows.push(ListedObject {
+                    key,
+                    leaf: leaf_name,
+                    size: meta.size,
+                    modified: meta.modified,
+                    version: listing_version_from(&meta),
+                });
+                if rows.len() == limit.get() {
+                    break;
                 }
-                None => ObjectKey::parse(&leaf_name).map_err(map_key_err)?,
-            };
-            rows.push(ListedObject {
-                key,
-                leaf: leaf_name,
-                size: meta.size,
-                modified: meta.modified,
-                version: listing_version_from(&meta),
-            });
+            }
+
+            if rows.len() == limit.get() || !batch_more {
+                more = batch_more && rows.len() == limit.get();
+                break;
+            }
+
+            current_after = last_leaf_in_batch;
         }
+
         let next = if more {
             rows.last().map(|r| adapter::page_token(r.leaf.clone()))
         } else {

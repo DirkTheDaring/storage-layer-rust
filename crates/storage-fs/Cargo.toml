@@ -12,7 +12,7 @@ libc.workspace = true
 sha2.workspace = true
 storage-core.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", default-features = false, features = ["rt", "fs"] }
+tokio = { version = "1", default-features = false, features = ["rt", "fs", "sync"] }
 
 [features]
 # Opt-in, test-only deterministic syscall fault-injection seam consulted by the

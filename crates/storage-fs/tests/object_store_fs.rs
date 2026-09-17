@@ -513,6 +513,125 @@ async fn seed_expect_err_or_external_untouched(
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn list_page_concurrent_unlinks_monotonic_and_resilient() {
+    let root = TempDir::new().unwrap();
+    let store = Arc::new(FsObjectStore::open(root.path()).unwrap());
+    let prefix = key("testdir");
+
+    for i in 0..40 {
+        seed(&store, &key(&format!("testdir/f{:02}", i)), b"data").await;
+    }
+
+    let s_clone = store.clone();
+    let unlinker = tokio::spawn(async move {
+        for i in 0..20 {
+            let _ = s_clone.delete(&key(&format!("testdir/f{:02}", i))).await;
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let mut continuation_token = None;
+    let mut collected = Vec::new();
+    let mut last_seen_leaf = String::new();
+
+    loop {
+        let page = store
+            .list_page(Some(&prefix), continuation_token.as_ref(), nz(5))
+            .await
+            .unwrap();
+        assert!(
+            !(page.objects.is_empty() && page.next.is_some()),
+            "callers must never observe an empty page with a continuation token"
+        );
+        for obj in page.objects {
+            assert!(
+                obj.leaf > last_seen_leaf,
+                "listing order must be strictly monotonic: {} <= {}",
+                obj.leaf,
+                last_seen_leaf
+            );
+            last_seen_leaf = obj.leaf.clone();
+            collected.push(obj.leaf);
+        }
+        continuation_token = page.next;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
+    let _ = unlinker.await;
+    assert!(!collected.is_empty(), "must have listed surviving files");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_page_adversarial_corner_cases() {
+    let root = TempDir::new().unwrap();
+    let store = FsObjectStore::open(root.path()).unwrap();
+
+    // 1. Non-existent prefix -> returns empty page with None next token
+    let non_existent = key("does/not/exist");
+    let page = store
+        .list_page(Some(&non_existent), None, nz(10))
+        .await
+        .unwrap();
+    assert!(page.objects.is_empty());
+    assert!(page.next.is_none());
+
+    // 2. Listing under root (prefix == None)
+    seed(&store, &key("root_a"), b"data_a").await;
+    seed(&store, &key("root_b"), b"data_b").await;
+    seed(&store, &key("root_c"), b"data_c").await;
+
+    // 3. Extreme limit = usize::MAX on root listing (safe from capacity overflow/OOM panic)
+    let page_max = store.list_page(None, None, nz(usize::MAX)).await.unwrap();
+    assert_eq!(page_max.objects.len(), 3);
+    assert!(page_max.next.is_none());
+
+    // 4. Limit = 1: strict single-item stepping
+    let p1 = store.list_page(None, None, nz(1)).await.unwrap();
+    assert_eq!(p1.objects.len(), 1);
+    assert_eq!(p1.objects[0].leaf, "root_a");
+    assert!(p1.next.is_some());
+
+    let p2 = store
+        .list_page(None, p1.next.as_ref(), nz(1))
+        .await
+        .unwrap();
+    assert_eq!(p2.objects.len(), 1);
+    assert_eq!(p2.objects[0].leaf, "root_b");
+    assert!(p2.next.is_some());
+
+    let p3 = store
+        .list_page(None, p2.next.as_ref(), nz(1))
+        .await
+        .unwrap();
+    assert_eq!(p3.objects.len(), 1);
+    assert_eq!(p3.objects[0].leaf, "root_c");
+    assert!(
+        p3.next.is_none(),
+        "terminal page on exact boundary has None next token"
+    );
+
+    // 5. after token is after all items
+    let tok_z = storage_core::object_store::adapter::page_token("root_z");
+    let p_after = store.list_page(None, Some(&tok_z), nz(10)).await.unwrap();
+    assert!(p_after.objects.is_empty());
+    assert!(p_after.next.is_none());
+
+    // 6. Vanished leaves / gap jumping: delete root_b, then list with limit = 2
+    store.delete(&key("root_b")).await.unwrap();
+    let p_gap = store.list_page(None, None, nz(2)).await.unwrap();
+    assert_eq!(p_gap.objects.len(), 2);
+    assert_eq!(p_gap.objects[0].leaf, "root_a");
+    assert_eq!(p_gap.objects[1].leaf, "root_c");
+    assert!(
+        p_gap.next.is_none(),
+        "exact boundary with 2 remaining objects has None next token"
+    );
+    assert!(!(p_gap.objects.is_empty() && p_gap.next.is_some()));
+}
+
 // -------------------------------------------------- durability strengths
 
 #[cfg(feature = "fault-injection")]
