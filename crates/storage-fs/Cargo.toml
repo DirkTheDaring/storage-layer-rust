@@ -2,6 +2,7 @@
 name = "storage-fs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 description = "Descriptor-relative filesystem storage adapter"
 
