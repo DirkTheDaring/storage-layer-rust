@@ -563,6 +563,67 @@ impl ObjectPayloadReader for FsMetadataReader {
             ))
         }
     }
+
+    async fn open_payload_range(
+        &self,
+        key: &ObjectKey,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectPayload, ReadError> {
+        #[cfg(target_os = "linux")]
+        {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    return Err(ReadError::backend_with_source(
+                        "tokio runtime required to execute blocking payload acquisition",
+                        Box::new(FsMetadataError::RuntimeMissing(err)),
+                    ));
+                }
+            };
+
+            let root_fd = Arc::clone(&self.root_fd);
+            let key = key.clone();
+            #[cfg(test)]
+            let payload_test_hooks = self.payload_test_hooks.clone();
+
+            let join_res = handle
+                .spawn_blocking(move || {
+                    let (metadata, mut std_file) = payload::acquire_payload_sync(
+                        &root_fd,
+                        &key,
+                        #[cfg(test)]
+                        payload_test_hooks.as_ref(),
+                    )?;
+                    payload::seek_payload_range(&mut std_file, offset, length, metadata.size())?;
+                    Ok((metadata, std_file))
+                })
+                .await;
+
+            match join_res {
+                Ok(Ok((metadata, std_file))) => {
+                    let tokio_file = tokio::fs::File::from_std(std_file);
+                    let stream: ObjectStream =
+                        Box::pin(tokio::io::AsyncReadExt::take(tokio_file, length));
+                    Ok(ObjectPayload::new(metadata, stream))
+                }
+                Ok(Err(read_err)) => Err(read_err),
+                Err(join_err) => Err(ReadError::backend_with_source(
+                    "blocking payload acquisition task failed",
+                    Box::new(FsMetadataError::TaskJoinFailed(join_err)),
+                )),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (key, offset, length);
+            Err(ReadError::backend_with_source(
+                "platform unsupported: descriptor-relative containment requires Linux openat2",
+                Box::new(FsMetadataError::PlatformUnsupported),
+            ))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

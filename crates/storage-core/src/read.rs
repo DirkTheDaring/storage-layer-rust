@@ -155,6 +155,46 @@ pub trait ObjectPayloadReader: Send + Sync {
     /// [`ReadError::PermissionDenied`] if access is denied, or
     /// [`ReadError::Backend`] on internal acquisition failure.
     async fn open_payload(&self, key: &ObjectKey) -> Result<ObjectPayload, ReadError>;
+
+    /// Opens `length` bytes starting at `offset`.
+    ///
+    /// `ObjectMetadata::size` stays the full object size. The stream yields at most
+    /// `length` bytes. The default reads and discards the prefix; filesystem
+    /// production code seeks before the file is type-erased instead of using it.
+    async fn open_payload_range(
+        &self,
+        key: &ObjectKey,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectPayload, ReadError> {
+        let payload = self.open_payload(key).await?;
+        let (meta, mut stream) = payload.into_parts();
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| ReadError::backend("byte range exceeds object"))?;
+        if end > meta.size() {
+            return Err(ReadError::backend("byte range exceeds object"));
+        }
+        let mut remaining = offset;
+        let mut buf = [0u8; 8192];
+        while remaining > 0 {
+            let n = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf[..n])
+                .await
+                .map_err(|err| {
+                    ReadError::backend_with_source(
+                        "failed to discard bytes before a ranged read",
+                        Box::new(err),
+                    )
+                })?;
+            if read == 0 {
+                return Err(ReadError::backend("byte range exceeds object"));
+            }
+            remaining -= read as u64;
+        }
+        let limited: ObjectStream = Box::pin(tokio::io::AsyncReadExt::take(stream, length));
+        Ok(ObjectPayload::new(meta, limited))
+    }
 }
 
 #[cfg(test)]

@@ -271,6 +271,31 @@ pub(crate) fn acquire_payload_sync(
     res
 }
 
+/// Positions `file` at `offset` and checks that `offset + length` fits in `size`.
+///
+/// The seek is the range implementation. Callers limit the subsequent read to
+/// `length`. This does not read the prefix.
+#[cfg(target_os = "linux")]
+pub(crate) fn seek_payload_range(
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    size: u64,
+) -> Result<(), ReadError> {
+    use std::io::{Seek, SeekFrom};
+
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| ReadError::backend("byte range exceeds object"))?;
+    if end > size {
+        return Err(ReadError::backend("byte range exceeds object"));
+    }
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        ReadError::backend_with_source("failed to seek blob payload", Box::new(err))
+    })?;
+    Ok(())
+}
+
 #[cfg(all(test, not(target_os = "linux")))]
 mod non_linux_tests {
     use super::*;
@@ -313,6 +338,39 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
     use storage_core::{ObjectKey, ObjectPayloadReader, ReadError};
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn seek_payload_range_positions_file_at_offset() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("blob.bin");
+        let mut content = vec![7u8; 200];
+        content[50] = 9;
+        std::fs::write(&path, &content).expect("write");
+        let mut file = std::fs::File::open(&path).expect("open");
+        seek_payload_range(&mut file, 50, 1, content.len() as u64).expect("seek");
+        use std::io::Seek;
+        assert_eq!(file.stream_position().expect("position"), 50);
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut file, &mut byte).expect("read"), 1);
+        assert_eq!(byte[0], 9);
+    }
+
+    #[tokio::test]
+    async fn open_payload_range_returns_the_span_and_full_size() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut content = vec![0u8; 64];
+        content[40] = 0xAB;
+        content[41] = 0xCD;
+        std::fs::write(temp_dir.path().join("blob.bin"), &content).expect("write");
+        let reader = FsMetadataReader::open(temp_dir.path()).expect("open");
+        let key = ObjectKey::parse("blob.bin").expect("key");
+        let payload = reader.open_payload_range(&key, 40, 2).await.expect("range");
+        assert_eq!(payload.metadata().size(), content.len() as u64);
+        let (_meta, mut stream) = payload.into_parts();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        assert_eq!(buf, [0xAB, 0xCD]);
+    }
 
     // -------------------------------------------------------------------------
     // 1. Regular-file metadata, exact bytes, fixed-buffer consumption, and EOF

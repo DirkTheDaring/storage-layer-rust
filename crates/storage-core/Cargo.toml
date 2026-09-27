@@ -10,7 +10,7 @@ description = "Domain-free core storage contracts and primitives"
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", default-features = false }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [features]
 # Reusable backend contract-test suite plus its in-memory MODEL store. The
