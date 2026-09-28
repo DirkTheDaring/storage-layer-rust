@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use storage_core::{
+use naust_storage_core::{
     ObjectKey, ObjectMetadata, ObjectMetadataReader, ObjectPayload, ObjectPayloadReader,
     ObjectStream, ReadError,
 };
@@ -186,7 +186,7 @@ impl FsMetadataReader {
     /// Probes whether the host kernel and container execution environment permit descriptor-relative `openat2` resolution.
     ///
     /// This is an explicit public backend-specific API on [`FsMetadataReader`] with a private syscall implementation.
-    /// No automatic invocation from [`open`](Self::open) or [`head`](storage_core::ObjectMetadataReader::head) is introduced;
+    /// No automatic invocation from [`open`](Self::open) or [`head`](naust_storage_core::ObjectMetadataReader::head) is introduced;
     /// downstream integration remains deferred.
     ///
     /// # Scope of Success
@@ -203,9 +203,9 @@ impl FsMetadataReader {
     ///   the calling thread may block indefinitely, identically to [`open`](Self::open).
     ///
     /// # Important Contract Distinction
-    /// - `"."` is rejected as an [`ObjectKey`](storage_core::ObjectKey) by design (`ObjectKeyError::DotSegment`).
+    /// - `"."` is rejected as an [`ObjectKey`](naust_storage_core::ObjectKey) by design (`ObjectKeyError::DotSegment`).
     /// - This method is a backend-private syscall probe on [`FsMetadataReader`]; it does **not** construct
-    ///   an `ObjectKey` and does not route through the regular-file-only [`head`](storage_core::ObjectMetadataReader::head) method.
+    ///   an `ObjectKey` and does not route through the regular-file-only [`head`](naust_storage_core::ObjectMetadataReader::head) method.
     ///   `ObjectKey` validation rules are preserved without weakening.
     ///
     /// # Error Mapping
@@ -232,7 +232,7 @@ impl FsMetadataReader {
     /// ```
     /// # #[cfg(target_os = "linux")]
     /// # {
-    /// use storage_fs::FsMetadataReader;
+    /// use naust_storage_fs::FsMetadataReader;
     ///
     /// let temp_dir = tempfile::tempdir().unwrap();
     /// let reader = FsMetadataReader::open(temp_dir.path()).unwrap();

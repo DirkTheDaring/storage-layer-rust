@@ -36,7 +36,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use storage_core::{ObjectKey, ObjectMetadata};
+use naust_storage_core::{ObjectKey, ObjectMetadata};
 
 /// Errors that can occur during experimental two-phase payload acquisition.
 #[derive(Debug, thiserror::Error)]

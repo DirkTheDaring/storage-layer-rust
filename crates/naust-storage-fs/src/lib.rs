@@ -1,13 +1,13 @@
 //! # `storage-fs`
 //!
-//! Descriptor-relative filesystem storage adapter implementing [`storage_core::ObjectMetadataReader`]
-//! and [`storage_core::ObjectPayloadReader`].
+//! Descriptor-relative filesystem storage adapter implementing [`naust_storage_core::ObjectMetadataReader`]
+//! and [`naust_storage_core::ObjectPayloadReader`].
 //!
 //! ## Architectural Ownership Boundaries
-//! - **`storage-core`**: Defines domain-neutral contracts ([`ObjectKey`](storage_core::ObjectKey),
-//!   [`ObjectMetadata`](storage_core::ObjectMetadata), [`ObjectMetadataReader`](storage_core::ObjectMetadataReader),
-//!   [`ObjectPayload`](storage_core::ObjectPayload), [`ObjectPayloadReader`](storage_core::ObjectPayloadReader),
-//!   [`ObjectStream`](storage_core::ObjectStream), and [`ReadError`](storage_core::ReadError)).
+//! - **`storage-core`**: Defines domain-neutral contracts ([`ObjectKey`](naust_storage_core::ObjectKey),
+//!   [`ObjectMetadata`](naust_storage_core::ObjectMetadata), [`ObjectMetadataReader`](naust_storage_core::ObjectMetadataReader),
+//!   [`ObjectPayload`](naust_storage_core::ObjectPayload), [`ObjectPayloadReader`](naust_storage_core::ObjectPayloadReader),
+//!   [`ObjectStream`](naust_storage_core::ObjectStream), and [`ReadError`](naust_storage_core::ReadError)).
 //! - **`storage-fs`**: Implements filesystem-specific storage operations over a pinned directory descriptor
 //!   using Linux `openat2` containment flags, executing blocking operations on Tokio's blocking thread pool.
 //! - **`registry-rust`**: Retains namespace routing, quarantine fallback orchestration, and outward
@@ -15,7 +15,7 @@
 //!
 //! ## Execution Boundary and Latency
 //! - Async metadata inquiry ([`head`](reader::FsMetadataReader::head)), payload opening
-//!   ([`open_payload`](storage_core::ObjectPayloadReader::open_payload)), and file metadata inspection
+//!   ([`open_payload`](naust_storage_core::ObjectPayloadReader::open_payload)), and file metadata inspection
 //!   ([`inspect_file_metadata`](reader::FsMetadataReader::inspect_file_metadata)) offload initial blocking filesystem
 //!   syscalls (`openat2`, `fstat`, `/proc/self/fd` reopening) to Tokio's blocking pool
 //!   (`tokio::task::spawn_blocking`) and require an entered Tokio runtime.
@@ -55,7 +55,7 @@
 //! attacker-substituted procfs target. Procfs trust and availability are prerequisites for any future registry cutover.
 //!
 //! ## Stream Lifecycle and Delayed Descriptor Closure
-//! The returned [`storage_core::ObjectPayload`] and its [`storage_core::ObjectStream`] own their underlying file
+//! The returned [`naust_storage_core::ObjectPayload`] and its [`naust_storage_core::ObjectStream`] own their underlying file
 //! descriptors and do not borrow from the reader or key. In-flight streams remain fully operational even if the
 //! originating reader and key are dropped, provided their required Tokio runtime remains active.
 //! Outstanding I/O operations can retain the underlying file handle and delay descriptor closure; no particular
@@ -89,18 +89,18 @@
 //!   typed `PlatformUnsupported`; non-Linux compilation and execution remain unverified in the absence of a cross-compilation environment.
 //!
 //! ## Error Model Demarcation
-//! - In `head` metadata inquiries, Phase 1 resolution errors map to [`ReadError::NotFound`](storage_core::ReadError::NotFound),
-//!   [`ReadError::PermissionDenied`](storage_core::ReadError::PermissionDenied), or [`ReadError::Backend`](storage_core::ReadError::Backend).
+//! - In `head` metadata inquiries, Phase 1 resolution errors map to [`ReadError::NotFound`](naust_storage_core::ReadError::NotFound),
+//!   [`ReadError::PermissionDenied`](naust_storage_core::ReadError::PermissionDenied), or [`ReadError::Backend`](naust_storage_core::ReadError::Backend).
 //! - In `inspect_file_metadata` inquiries:
-//!   - Resolution `ENOENT` maps to [`ReadError::NotFound`](storage_core::ReadError::NotFound).
-//!   - Resolution `EACCES`/`EPERM` maps to [`ReadError::PermissionDenied`](storage_core::ReadError::PermissionDenied).
-//!   - Symlinks encountered during resolution (`ELOOP`/`EXDEV`) map to [`ReadError::Backend`](storage_core::ReadError::Backend)
+//!   - Resolution `ENOENT` maps to [`ReadError::NotFound`](naust_storage_core::ReadError::NotFound).
+//!   - Resolution `EACCES`/`EPERM` maps to [`ReadError::PermissionDenied`](naust_storage_core::ReadError::PermissionDenied).
+//!   - Symlinks encountered during resolution (`ELOOP`/`EXDEV`) map to [`ReadError::Backend`](naust_storage_core::ReadError::Backend)
 //!     wrapping [`FsMetadataError::ResolutionRejected`].
-//!   - `openat2` `ENOSYS` maps to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::SyscallUnsupported`].
-//!   - `fstat` failure maps to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::StatFailed`].
+//!   - `openat2` `ENOSYS` maps to [`ReadError::Backend`](naust_storage_core::ReadError::Backend) wrapping [`FsMetadataError::SyscallUnsupported`].
+//!   - `fstat` failure maps to [`ReadError::Backend`](naust_storage_core::ReadError::Backend) wrapping [`FsMetadataError::StatFailed`].
 //!   - Acquired non-regular objects (directories, FIFOs, character/block devices, sockets) map to
-//!     [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::UnsupportedObjectType`].
-//!   - Invalid size or timestamp fields map to [`ReadError::Backend`](storage_core::ReadError::Backend) wrapping [`FsMetadataError::InvalidMetadata`].
+//!     [`ReadError::Backend`](naust_storage_core::ReadError::Backend) wrapping [`FsMetadataError::UnsupportedObjectType`].
+//!   - Invalid size or timestamp fields map to [`ReadError::Backend`](naust_storage_core::ReadError::Backend) wrapping [`FsMetadataError::InvalidMetadata`].
 //! - In `open_payload` acquisitions, errors are partitioned into distinct stages:
 //!   - Phase 1 resolution uses typed resolution classification.
 //!   - Non-regular files reject via [`FsMetadataError::UnsupportedObjectType`].

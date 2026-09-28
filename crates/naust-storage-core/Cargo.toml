@@ -1,5 +1,5 @@
 [package]
-name = "storage-core"
+name = "naust-storage-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,11 +13,6 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [features]
-# Reusable backend contract-test suite plus its in-memory MODEL store. The
-# model is test scaffolding only — it is feature-gated precisely so it can
-# never become a hidden third production backend. Adapter crates enable this
-# feature from their dev-dependencies to run the same suite against their
-# real implementations.
 contract-tests = []
 
 [[test]]

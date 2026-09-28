@@ -1,5 +1,5 @@
 //! Integration tests for the descriptor-relative contained mutation surface
-//! (`storage_fs::mutate`). Linux-gated: the whole surface requires `openat2`.
+//! (`naust_storage_fs::mutate`). Linux-gated: the whole surface requires `openat2`.
 //!
 //! These exercise the *dependency* primitives directly (containment, bounded reads,
 //! inspection, stable locking, the owned blocking boundary, atomic replacement,
@@ -11,7 +11,9 @@
 
 use std::os::unix::fs::symlink;
 
-use storage_fs::{DirEnumerationLimits, FileName, FsMetadataReader, FsMutateError, LeafWriteMode};
+use naust_storage_fs::{
+    DirEnumerationLimits, FileName, FsMetadataReader, FsMutateError, LeafWriteMode,
+};
 
 fn reader(dir: &std::path::Path) -> FsMetadataReader {
     FsMetadataReader::open(dir).expect("open reader")
@@ -406,7 +408,7 @@ static FAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn ensure_subdir_creation_syncs_parent_and_propagates_failure() {
-    use storage_fs::mutate::fault;
+    use naust_storage_fs::mutate::fault;
     let _serial = FAULT_TEST_LOCK.lock().await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -463,7 +465,7 @@ async fn ensure_subdir_creation_syncs_parent_and_propagates_failure() {
 #[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn dir_sync_fault_propagates_by_display_path() {
-    use storage_fs::mutate::fault;
+    use naust_storage_fs::mutate::fault;
     let _serial = FAULT_TEST_LOCK.lock().await;
 
     let tmp = tempfile::tempdir().unwrap();

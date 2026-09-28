@@ -3,8 +3,8 @@
 //! central Phase 1 conformance deliverable. The suite is not duplicated:
 //! these are the exact checks the reference model passes.
 
-use storage_core::contract;
-use storage_fs::FsObjectStore;
+use naust_storage_core::contract;
+use naust_storage_fs::FsObjectStore;
 use tempfile::TempDir;
 
 fn fresh_store() -> (TempDir, FsObjectStore) {

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use storage_core::contract;
-use storage_s3::S3ObjectStore;
-use storage_s3::mock::MockS3Client;
+use naust_storage_core::contract;
+use naust_storage_s3::S3ObjectStore;
+use naust_storage_s3::mock::MockS3Client;
 
 fn fresh_store(prefix: Option<&str>) -> S3ObjectStore {
     S3ObjectStore::new(Arc::new(MockS3Client::new()), prefix).expect("construct store")

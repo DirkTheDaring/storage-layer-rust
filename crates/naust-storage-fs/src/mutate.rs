@@ -1,4 +1,4 @@
-//! # Descriptor-relative contained mutation (`storage_fs::mutate`)
+//! # Descriptor-relative contained mutation (`naust_storage_fs::mutate`)
 //!
 //! Additive, Linux-gated primitives that extend the read-only [`FsMetadataReader`]
 //! with **descriptor-relative mutation** anchored on directory descriptors that are

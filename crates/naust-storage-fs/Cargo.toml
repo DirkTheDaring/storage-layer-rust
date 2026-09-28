@@ -1,5 +1,5 @@
 [package]
-name = "storage-fs"
+name = "naust-storage-fs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,18 +10,15 @@ description = "Descriptor-relative filesystem storage adapter"
 async-trait.workspace = true
 bytes.workspace = true
 libc.workspace = true
+naust-storage-core.workspace = true
 sha2.workspace = true
-storage-core.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt", "fs", "sync"] }
 
 [features]
-# Opt-in, test-only deterministic syscall fault-injection seam consulted by the
-# atomic-write / rename primitives (see `mutate::fault`). Off by default; a downstream
-# crate enables it ONLY through a dev-dependency so production builds never include it.
 fault-injection = []
 
 [dev-dependencies]
-storage-core = { workspace = true, features = ["contract-tests"] }
+naust-storage-core = { workspace = true, features = ["contract-tests"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "io-util", "rt-multi-thread", "sync", "time"] }

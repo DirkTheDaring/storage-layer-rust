@@ -7,13 +7,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use storage_core::ObjectKey;
-use storage_core::object_store::{
+use naust_storage_core::ObjectKey;
+use naust_storage_core::object_store::{
     ConditionalDeleteOutcome, CreateOutcome, Durability, ObjectStore, PageToken, ReplaceOutcome,
     StoreError,
 };
-use storage_s3::S3ObjectStore;
-use storage_s3::mock::MockS3Client;
+use naust_storage_s3::S3ObjectStore;
+use naust_storage_s3::mock::MockS3Client;
 
 fn key(s: &str) -> ObjectKey {
     ObjectKey::parse(s).expect("valid key")

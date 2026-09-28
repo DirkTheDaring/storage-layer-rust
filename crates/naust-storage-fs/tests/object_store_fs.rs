@@ -9,11 +9,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use storage_core::ObjectKey;
-use storage_core::object_store::{
+use naust_storage_core::ObjectKey;
+use naust_storage_core::object_store::{
     ConditionalDeleteOutcome, CreateOutcome, Durability, ObjectStore, ReplaceOutcome, StoreError,
 };
-use storage_fs::FsObjectStore;
+use naust_storage_fs::FsObjectStore;
 use tempfile::TempDir;
 
 fn key(s: &str) -> ObjectKey {
@@ -370,7 +370,7 @@ async fn namespace_collision_names_are_ordinary_generic_objects() {
         root.path().join("\u{1}fsos.internal").exists()
             || root
                 .path()
-                .join(storage_fs::object_store::INTERNAL_DIR)
+                .join(naust_storage_fs::object_store::INTERNAL_DIR)
                 .exists(),
         "internal tree exists after conditional ops"
     );
@@ -480,7 +480,7 @@ async fn internal_tree_cannot_be_redirected_through_symlink() {
     let external = TempDir::new().unwrap();
     // Pre-plant a SYMLINK at the internal control-char name.
     let internal_name =
-        std::ffi::OsStr::from_bytes(storage_fs::object_store::INTERNAL_DIR.as_bytes());
+        std::ffi::OsStr::from_bytes(naust_storage_fs::object_store::INTERNAL_DIR.as_bytes());
     std::os::unix::fs::symlink(external.path(), root.path().join(internal_name)).unwrap();
 
     let store = FsObjectStore::open(root.path()).unwrap();
@@ -492,7 +492,7 @@ async fn internal_tree_cannot_be_redirected_through_symlink() {
 
 async fn seed_expect_err_or_external_untouched(
     store: &FsObjectStore,
-    k: &storage_core::ObjectKey,
+    k: &naust_storage_core::ObjectKey,
     external: &std::path::Path,
 ) {
     // Plain write also uses the internal staging tree.
@@ -614,7 +614,7 @@ async fn list_page_adversarial_corner_cases() {
     );
 
     // 5. after token is after all items
-    let tok_z = storage_core::object_store::adapter::page_token("root_z");
+    let tok_z = naust_storage_core::object_store::adapter::page_token("root_z");
     let p_after = store.list_page(None, Some(&tok_z), nz(10)).await.unwrap();
     assert!(p_after.objects.is_empty());
     assert!(p_after.next.is_none());
@@ -637,7 +637,7 @@ async fn list_page_adversarial_corner_cases() {
 #[cfg(feature = "fault-injection")]
 mod durability_faults {
     use super::*;
-    use storage_fs::mutate::fault::{self, FaultPoint};
+    use naust_storage_fs::mutate::fault::{self, FaultPoint};
 
     // The fault table (and `fault::reset`) is process-global: serialize the
     // fault tests so one test's teardown cannot clear another's armed rules.

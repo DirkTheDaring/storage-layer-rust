@@ -47,8 +47,8 @@ use std::num::NonZeroUsize;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use storage_core::ObjectKey;
-use storage_core::object_store::{
+use naust_storage_core::ObjectKey;
+use naust_storage_core::object_store::{
     ConditionalDeleteOutcome, CreateOutcome, Durability, ListPage, ListedObject, ListingVersion,
     ObjectMeta, ObjectRead, ObjectStore, ObjectVersion, PageToken, ReplaceOutcome, StoreError,
     VersionedRead, adapter,

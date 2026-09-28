@@ -35,7 +35,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(all(test, target_os = "linux"))]
 use std::sync::Arc;
 
-use storage_core::{ObjectKey, ReadError};
+use naust_storage_core::{ObjectKey, ReadError};
 
 use crate::error::FsMetadataError;
 

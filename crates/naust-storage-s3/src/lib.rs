@@ -1,7 +1,7 @@
 //! S3 adapter for the backend-neutral `storage-core` object-store contract
 //! (STORAGE-LAYER-MIGRATION Phase 2).
 //!
-//! Layering: `storage-core` owns the [`storage_core::ObjectStore`]
+//! Layering: `storage-core` owns the [`naust_storage_core::ObjectStore`]
 //! semantics; this crate owns S3 request mechanics (conditional PUT/DELETE
 //! via `If-Match`/`If-None-Match`, delimiter listing, ETag-backed opaque
 //! version tokens, one centralized error classification). It contains no

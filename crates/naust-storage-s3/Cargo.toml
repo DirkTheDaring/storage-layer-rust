@@ -1,5 +1,5 @@
 [package]
-name = "storage-s3"
+name = "naust-storage-s3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,17 +10,14 @@ description = "S3 object-store adapter for the backend-neutral storage-core cont
 async-trait.workspace = true
 aws-sdk-s3.workspace = true
 bytes.workspace = true
-storage-core.workspace = true
+naust-storage-core.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", default-features = false }
 
 [features]
-# Exports the deterministic in-memory `S3Client` mock (`storage_s3::mock`)
-# for tests of this crate and downstream consumers. Never a production
-# feature.
 mock-client = []
 
 [dev-dependencies]
-storage-core = { workspace = true, features = ["contract-tests"] }
-storage-s3 = { path = ".", features = ["mock-client"] }
+naust-storage-core = { workspace = true, features = ["contract-tests"] }
+naust-storage-s3 = { path = ".", features = ["mock-client"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

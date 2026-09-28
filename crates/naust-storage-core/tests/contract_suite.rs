@@ -4,7 +4,7 @@
 //! migration phases; this test validates the suite and the contracts
 //! themselves.
 
-use storage_core::contract::{self, model::ModelObjectStore};
+use naust_storage_core::contract::{self, model::ModelObjectStore};
 
 #[tokio::test]
 async fn model_store_satisfies_core_contract_suite() {

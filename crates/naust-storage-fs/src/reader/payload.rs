@@ -1,11 +1,11 @@
 //! Standalone payload acquisition implementation and focused tests for `storage-fs`.
 //!
 //! # Architectural Ownership Boundaries
-//! - Implements [`storage_core::ObjectPayloadReader`] for [`crate::FsMetadataReader`].
+//! - Implements [`naust_storage_core::ObjectPayloadReader`] for [`crate::FsMetadataReader`].
 //! - Uses descriptor-relative containment on Linux (`openat2` + `O_PATH`) to validate object type,
 //!   followed by readable reopening via `/proc/self/fd/N` (`O_RDONLY`), re-verifying identity (`st_dev`/`st_ino`).
-//! - Returns [`storage_core::ObjectPayload`] wrapping initial [`storage_core::ObjectMetadata`]
-//!   and a boxed [`tokio::fs::File`] stream as [`storage_core::ObjectStream`].
+//! - Returns [`naust_storage_core::ObjectPayload`] wrapping initial [`naust_storage_core::ObjectMetadata`]
+//!   and a boxed [`tokio::fs::File`] stream as [`naust_storage_core::ObjectStream`].
 //!
 //! # Explicit Procfs Trust Assumption
 //! This implementation operates under the explicit, documented assumption that `/proc/self/fd`
@@ -28,7 +28,7 @@ use std::sync::Arc;
 #[cfg(all(test, target_os = "linux"))]
 use std::sync::atomic::AtomicBool;
 
-use storage_core::{ObjectKey, ObjectMetadata, ReadError};
+use naust_storage_core::{ObjectKey, ObjectMetadata, ReadError};
 
 #[cfg(target_os = "linux")]
 use crate::error::FsMetadataError;
@@ -300,8 +300,8 @@ pub(crate) fn seek_payload_range(
 mod non_linux_tests {
     use super::*;
     use crate::FsMetadataReader;
+    use naust_storage_core::ObjectPayloadReader;
     use std::path::PathBuf;
-    use storage_core::ObjectPayloadReader;
 
     #[tokio::test]
     async fn test_payload_reader_non_linux_platform_unsupported() {
@@ -333,10 +333,10 @@ mod non_linux_tests {
 pub(crate) mod tests {
     use super::*;
     use crate::FsMetadataReader;
+    use naust_storage_core::{ObjectKey, ObjectPayloadReader, ReadError};
     use std::os::unix::ffi::OsStrExt;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use storage_core::{ObjectKey, ObjectPayloadReader, ReadError};
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -435,7 +435,7 @@ pub(crate) mod tests {
     // -------------------------------------------------------------------------
     #[tokio::test]
     async fn test_shared_pinned_root_across_root_path_relocation() {
-        use storage_core::ObjectMetadataReader;
+        use naust_storage_core::ObjectMetadataReader;
 
         let parent_dir = tempfile::tempdir().expect("parent tempdir");
         let initial_root = parent_dir.path().join("initial_root");

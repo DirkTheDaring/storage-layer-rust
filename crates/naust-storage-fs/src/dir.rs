@@ -62,7 +62,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
-use storage_core::ObjectKey;
+use naust_storage_core::ObjectKey;
 
 /// Backend-neutral leaf filter: an entry is a candidate generic object iff its name
 /// is a valid single-component generic key.

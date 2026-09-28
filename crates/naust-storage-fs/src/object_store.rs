@@ -73,12 +73,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::Digest as _;
 
-use storage_core::object_store::{
+use naust_storage_core::object_store::{
     ConditionalDeleteOutcome, CreateOutcome, Durability, ListPage, ListedObject, ListingVersion,
     ObjectMeta, ObjectRead, ObjectStore, ObjectVersion, PageToken, ReplaceOutcome, StoreError,
     VersionedRead, adapter,
 };
-use storage_core::{ObjectKey, ObjectKeyError};
+use naust_storage_core::{ObjectKey, ObjectKeyError};
 
 use crate::mutate::{BlockingDir, ContainedDir, FileName, FsMutateError};
 use crate::reader::FsMetadataReader;
